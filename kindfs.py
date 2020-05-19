@@ -16,6 +16,7 @@ from collections import defaultdict
 import time
 from fuse import FUSE, Operations #FuseOSError
 import magic
+import re
 
 #import bisect
 #import chardet
@@ -59,16 +60,11 @@ def xxhash_file(filename, filesize=None, chunksize=1<<20, inclsize=False, inclna
 # DB class
 
 class DDB():
-    def __init__(self, dbname, domagic=False):
+    def __init__(self, dbname, domagic=True):
         self.conn = sqlite3.connect(dbname)
         #self.init_path=init_path.rstrip('/')
         self.magictypes = {}
-        if domagic==True:
-            cur = self.conn.cursor()
-            rs = cur.execute('select id,magictype from magictypes')
-            for line in rs:
-                magicid,magictype = line
-                self.magictypes[magictype] = magicid
+        self.domagic=domagic
 
     def createdb(self):
         cur = self.conn.cursor()
@@ -90,6 +86,7 @@ class DDB():
                 xxh64be integer,
                 st_mtime integer, st_mode integer, st_uid integer, st_gid integer, st_ino integer, st_nlink integer, st_dev integer,
                 dbsession integer not null,
+                magictype integer,
                 UNIQUE(parentdir,name,dbsession)
             );
             create index files_parentdir_idx on files(parentdir);
@@ -110,7 +107,6 @@ class DDB():
                 xxh64be integer,
                 st_mtime integer, st_mode integer, st_uid integer, st_gid integer, st_nlink integer, st_dev integer,
                 dbsession integer not null,
-                magictype integer,
                 UNIQUE(parentdir,name,dbsession)
             );
             create index dirs_parentdir_idx on dirs(parentdir);
@@ -158,11 +154,13 @@ class DDB():
         ''') # PRAGMA main.journal_mode=WAL;
 
     def magicid(self, path):
-        magictype = magic.from_file(path)
+        if self.domagic==False:
+            return 0
+        magictype = re.sub(', BuildID\[sha1\]=[0-9a-f]*','',magic.from_file(path, mime=False))
         if magictype in self.magictypes:
             return self.magictypes[magictype]
         cur = self.conn.cursor()
-        rs = cur.execute('insert into magictypes values(null,?)', (magictype))
+        rs = cur.execute('insert into magictypes values(null,?)', (magictype,))
         magic_id = cur.lastrowid
         self.magictypes[magictype] = magic_id
         return magic_id
@@ -199,10 +197,15 @@ class DDB():
             #     if(dirsize != allsize4 and dirsize!=0):
             #         print("___ " + str((curdir,allsize4,dirsize)))
 
+        if self.domagic==True:
+            rs = cur.execute('select id,magictype from magictypes')
+            for line in rs:
+                magicid,magictype = line
+                self.magictypes[magictype] = magicid
 
         print("\n==== Starting scan ====\n(already %d in DB)" % (processedsize>>20))
         mytime1=time.time()
-        cur.execute('insert or replace into dbsessions values (null, ?,?)', (int(mytime1), self.init_path))
+        cur.execute('insert or replace into dbsessions values (null, ?,?)', (int(mytime1), init_path))
         param_id=cur.lastrowid
         for (_dir, dirs, files) in os.walk(bytes(init_path, encoding='utf-8'), topdown=False):
             try:
@@ -261,10 +264,11 @@ class DDB():
                 processedfiles+=1
                 dirsize += filesize
                 xxh = xxhash_file(path, filesize)
+                mymagicid=self.magicid(path)
                 #bisect.insort(dircontents[dir], xxh)
                 dircontents.append(xxh)
                 res.append(( None, dir.replace(init_path, ''), file, path.replace(init_path, ''), filesize, xxh,
-                    int(filestat.st_mtime), filestat.st_mode, filestat.st_uid, filestat.st_gid, filestat.st_ino, filestat.st_nlink, filestat.st_dev, param_id
+                    int(filestat.st_mtime), filestat.st_mode, filestat.st_uid, filestat.st_gid, filestat.st_ino, filestat.st_nlink, filestat.st_dev, param_id, mymagicid
                 ))
                 #reslen= '(' + '?,' * (len(res)-1) + '?)'
                 #cur.execute('insert or replace into files values ' + reslen, res)
@@ -324,7 +328,7 @@ class DDB():
             #bisect.insort(dircontents[os.path.dirname(dir)], dirxxh)
             dirstat = os.lstat(dir)
             resdir = (
-                None, os.path.dirname(dir).replace(self.init_path, ''), os.path.basename(dir), dir.replace(init_path, ''), dirsize, len(files), len(dirs), dxxh,
+                None, os.path.dirname(dir).replace(init_path, ''), os.path.basename(dir), dir.replace(init_path, ''), dirsize, len(files), len(dirs), dxxh,
                 int(dirstat.st_mtime), dirstat.st_mode, dirstat.st_uid, dirstat.st_gid, dirstat.st_nlink, dirstat.st_dev, param_id
             )
             reslen2 =  '(' + '?,' * (len(resdir)-1) + '?)'
@@ -338,6 +342,7 @@ class DDB():
             #     conn.rollback()
             # else:
             #     conn.commit()
+        print('\nDone')
 
     def computedups(self):
         # select * from dirs where xxh64be in (select xxh64be from dirs group by xxh64be having count(*)>1) order by size desc
