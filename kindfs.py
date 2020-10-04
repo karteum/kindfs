@@ -60,7 +60,7 @@ def xxhash_file(filename, filesize=None, chunksize=1<<20, inclsize=False, inclna
 # DB class
 
 class DDB():
-    def __init__(self, dbname, domagic=True):
+    def __init__(self, dbname, domagic=False):
         self.conn = sqlite3.connect(dbname)
         #self.init_path=init_path.rstrip('/')
         self.magictypes = {}
@@ -153,10 +153,13 @@ class DDB():
             PRAGMA main.synchronous=NORMAL;
         ''') # PRAGMA main.journal_mode=WAL;
 
-    def magicid(self, path):
+    def magicid(self, path, domime=True):
         if self.domagic==False:
             return 0
-        magictype = re.sub(', BuildID\[sha1\]=[0-9a-f]*','',magic.from_file(path, mime=False))
+        if domime==True:
+            magictype = magic.from_file(path, mime=True)
+        else:
+            magictype = re.sub(', BuildID\[sha1\]=[0-9a-f]*','',magic.from_file(path))
         if magictype in self.magictypes:
             return self.magictypes[magictype]
         cur = self.conn.cursor()
@@ -173,6 +176,7 @@ class DDB():
         dirsizes = defaultdict(int)
         dirxxh = defaultdict(int)
         global globalsize
+        aflag=False
 
         cur = self.conn.cursor()
         #cur2 = self.conn.cursor()
@@ -277,10 +281,14 @@ class DDB():
                 #sys.stderr.write("\033[2K\r%s\rScanning: [%d %%, %d MB, %d files] %s" % (" " * 500, 100*processedsize/totalsize/1024, processedsize>>20, processedfiles, path))
                 #progress.updatef()
                 mytime2=time.time()
-                if (int(mytime2)%10) ==0 :
-                    self.conn.commit()
+                if (int(mytime2)%10)==0:
+                    if aflag==True:
+                        self.conn.commit()
+                    aflag=False
+                else:
+                    aflag=True
 
-                if mytime2-mytime1>0.1:
+                if mytime2-mytime1>0.2:
                     sys.stderr.write("\033[2K\rScanning: [%d MB, %d files] %s" % (processedsize>>20, processedfiles, dir))
                     sys.stderr.flush()
                     #conn.commit()
@@ -392,11 +400,17 @@ class DDB():
         rs = cur.execute("select name,xxh64be,size,path from files where size>0 and path like ? order by path", (path_test+'/%',))
         for line in rs:
             name,xxh,size,path=line
+            if excluded!="" and excluded in path:
+                continue
             rs2=cur2.execute("select path from files where xxh64be=? and size=? and path like ?", (xxh, size, path_ref+'/%')).fetchall()
-            if len(rs2)==0 and not excluded in path:
+            if len(rs2)==0:
                 print("___ %s has no equivalent" % (path))
-#            else:
-#                print("________ %s has %s equivalents" % (path, len(rs2)))
+            #else:
+            #    print("________ %s has %s equivalents" % (path, len(rs2)))
+                #sys.stdout.write('.')
+                #pass
+            #time.sleep(0.1)
+
 
 
 ######################################################
@@ -563,6 +577,7 @@ if __name__ == "__main__":
         if opmode=='RESETDB':
             print ('reset DB')
             ddb.createdb()
+            ddb.conn.commit()
         ddb.conn.execute('BEGIN')
         try:
             ddb.scandir(basedir)
