@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Created on Sat Feb 29 12:13:23 2020
-
-@author: adrien
-"""
+# Author: Adrien Demarez (adrien.demarez@free.fr)
+# Version: 20201121
+# License: GPLv3
 
 import sqlite3,xxhash
 import fnmatch
@@ -168,9 +166,9 @@ class DDB():
         self.magictypes[magictype] = magic_id
         return magic_id
 
-    def scandir(self, init_path1):
+    def scandir(self, init_path):
         #progress = progresswalk(init_path)
-        init_path=init_path1.rstrip('/')
+        init_path=init_path.rstrip('/')
         processedfiles=0
         option_excludelist=[]
         dirsizes = defaultdict(int)
@@ -212,12 +210,15 @@ class DDB():
         cur.execute('insert or replace into dbsessions values (null, ?,?)', (int(mytime1), init_path))
         param_id=cur.lastrowid
         for (_dir, dirs, files) in os.walk(bytes(init_path, encoding='utf-8'), topdown=False):
+            # FIXME: what happens if part of the path is utf-8 and another part of the path is 8859 ? => do proper convmv before
+            #_dir2=os.fsdecode(_dir)
+            #_dir=os.fsencode(_dir2)
             try:
                 dir=_dir.decode('utf-8')
             except UnicodeDecodeError:
                 dir=_dir.decode('8859')
             #print("==> entering " + dir)
-            #time.sleep(0.1)
+            #time.sleep(0.2)
             if dir in dirsizes: # and dir in dirxxh
             #    processedsize += dirsizes[dir]
                 #print (dir + "already in DB -> skipping")
@@ -289,7 +290,7 @@ class DDB():
                     aflag=True
 
                 if mytime2-mytime1>0.2:
-                    sys.stderr.write("\033[2K\rScanning: [%d MB, %d files] %s" % (processedsize>>20, processedfiles, dir))
+                    sys.stderr.write("\033[2K\rScanning: [%d MB, %d files] %s" % (processedsize>>20, processedfiles, dir.replace(init_path, '')))
                     sys.stderr.flush()
                     #conn.commit()
                     mytime1=mytime2
