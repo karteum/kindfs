@@ -3,6 +3,7 @@
 # Author: Adrien Demarez (adrien.demarez@free.fr)
 # Version: 20201121
 # License: GPLv3
+# Prerequisite : pip install xxhash numpy fusepy
 
 import sqlite3,xxhash
 import fnmatch
@@ -313,6 +314,7 @@ class DDB():
                     #print(mypath + " OK")
                 else: #if we do bottom-up, all subdirs are processed before the current dir so this should never happen
                     print("Problem : " + mypath + " not precomputed")
+                    # FIXME: handle access rights
                     #rs = cur.execute("select xxh64be,size from dirs where parentdir='%s' and name in %s" % (dir, "('"+"','".join(dirs)+"')"))
                     #rs = cur.execute("select xxh64be,size from dirs where parentdir=? and name=?", (dir, mydir))
                     #for k in rs:
@@ -416,6 +418,10 @@ class DDB():
 
 ######################################################
 # FUSE FS
+
+def fakecontents(xxh64be, mysize):
+    return ("0x%016x, %d\n" % (xxh64be+(1<<63), mysize)).encode()
+
 class DDBfs(Operations):
     def __init__(self, dbname, init_path='/'):
         dburi="file:" + dbname + "?mode=ro"
@@ -442,11 +448,11 @@ class DDBfs(Operations):
         for k in rs:
             src=k
             self.rmdir[src]=''
-        
+
     #@logme
     def readdir(self, path1, offset):
         path=path1.replace("/", self.init_path, 1).rstrip('/').replace("'","''")
-        print('readdir ' + path)
+        #print('readdir ' + path)
         cur = self.conn.cursor()
         res=['.', '..']
         rs1 = cur.execute("select name from dirs where parentdir='%s'" % (path)).fetchall()
@@ -487,20 +493,19 @@ class DDBfs(Operations):
         if not rs:
             print("read: error " + path)
             return -errno.ENOENT
-        foo = "0x%016x, %d\n" % (rs[0][0]+(1<<63), rs[0][1]) # %20d
-        foob = bytes(foo[offset:offset+size], encoding='utf8')
+        return fakecontents(rs[0][0], rs[0][1])[offset:offset+size]
+        #foo = "0x%016x, %d\n" % (rs[0][0]+(1<<63), rs[0][1]) # %20d
+        #foob = bytes(foo[offset:offset+size], encoding='utf8')
         #if size>len(foob):
         #    foob += bytes('\0', encoding='utf8') * (size-len(foob))
-        return foob
         #return foob.ljust(size,'\0')
 
     #@logme
     def getattr(self, path1, fh=None):
         path=path1.replace("/", self.init_path, 1).rstrip('/').replace("'","''")
-        print('getattr %s' % (path))
-        #return -errno.ENOENT
+        #print('getattr %s' % (path))
         if path1=='/' or path1.startswith('/.Trash'):
-            print('getattr: ' + path)
+            #print('getattr: ' + path)
             st={}
             for k in 'st_size', 'st_mtime', 'st_uid', 'st_gid', 'st_dev', 'st_ino', 'st_nlink', 'st_atime', 'st_ctime':
                 st[k] = 1000
@@ -509,7 +514,7 @@ class DDBfs(Operations):
         cur = self.conn.cursor()
         rs = cur.execute("select size, st_mtime, st_mode, st_uid, st_gid, st_dev, xxh64be as st_ino, 2 as st_nlink from dirs where path='%s'" % (path)).fetchall()
         if not rs:
-            rs = cur.execute("select size, st_mtime, st_mode, st_uid, st_gid, st_dev, xxh64be as st_ino, st_nlink from files where path='%s'" % (path)).fetchall() # 40 as size
+            rs = cur.execute("select size, st_mtime, st_mode, st_uid, st_gid, st_dev, xxh64be as st_ino, st_nlink, xxh64be from files where path='%s'" % (path)).fetchall() # FIXME: should I leave the real st_ino ?
         if not rs:
             rs = cur.execute("select 0 as size, 0 as st_mtime, %d as st_mode, 1000 as st_uid, 1000 as st_gid, 0 as st_dev, xxh64be as st_ino, 1 as st_nlink from symlinks where path='%s'" % (stat.S_IFLNK | 0o755, path)).fetchall()
         if not rs:
@@ -520,6 +525,9 @@ class DDBfs(Operations):
             st[k] = rs[0][v]
         st['st_atime']=0
         st['st_ctime']=0
+        st['st_blocks'] = math.ceil(st['st_size']/512)
+        if stat.S_ISREG(st['st_mode']):
+            st['st_size'] = len(fakecontents(rs[0][7],rs[0][0]))
         return st
 
     #@logme
