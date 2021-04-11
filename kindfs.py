@@ -4,6 +4,7 @@
 # Version: 20201121
 # License: GPLv3
 # Prerequisite : pip install xxhash numpy fusepy
+# Beware : this software only hashes portions of files for speed (and therefore may consider that some files/dirs are identical when they are not really). Use this program at your own risk and only when you know what you are doing !
 
 import sqlite3,xxhash
 import fnmatch
@@ -54,6 +55,21 @@ def xxhash_file(filename, filesize=None, chunksize=1<<20, inclsize=False, inclna
             digest.update(fh.read(CHUNKSIZE))
     return digest.intdigest() - (1<<63) # return integer rather than hexdigest because it is more efficient. "- (1<<63)" is there because SQLite3 unfortunately only supports signed 64 bits integers and doesn't support unsigned
 
+def mydecode_path(pathbytes,fixparts=False):
+    # In worst cases, there may be a mix of encoding in the path (e.g. beginning as utf8, and starting from some point some subdirs as iso8859, and deeper in the path again some utf8). The best way would be to use convmv to fix the issue before running this script. However in real life there may not always be a way to fix the data prior to processing, and I don't want the script to fail miserably in those cases => therefore here we return two decoded string : a first string with "surrogateescape" that can be used by os.* file methods (but cannot be printed or really used as string), and another string which cannot be used by file methods (it doesn't correspond to a valid path on the filesystem) but can be printed and manipulated (and inserted in the DB). For the latter, there are two options : either use error="replace" (default behavior), or fix every subsection of the path (slower, will convert every part nicely to utf8 for printing, but will also hide under the carpet that there is an issue that deserves to be fixed with convmv on this section of the filesystem)
+    if fixparts:
+        pathlist=pathbytes.split(b'/')
+        path_decoded=""
+        for k in pathlist:
+            try:
+                k2=k.decode('utf-8')
+            except UnicodeDecodeError:
+                k2=k.decode('8859')
+            path_decoded += '/'+k2
+        path_printable = path_decoded[1:]
+    else:
+        path_printable = pathbytes.decode('utf-8',errors="replace")
+    return pathbytes.decode('utf-8',errors="surrogateescape"), path_printable
 
 ######################################################
 # DB class
@@ -214,10 +230,16 @@ class DDB():
             # FIXME: what happens if part of the path is utf-8 and another part of the path is 8859 ? => do proper convmv before
             #_dir2=os.fsdecode(_dir)
             #_dir=os.fsencode(_dir2)
-            try:
-                dir=_dir.decode('utf-8')
-            except UnicodeDecodeError:
-                dir=_dir.decode('8859')
+            dir,dir_printable = mydecode_path(_dir)
+
+            #if _dir==bytes("/mnt/usb12t/_disks/x200_papa_20200612/jacques/_oldsave/Tera", encoding='utf-8'):
+                #print("skipping2 " + dir_printable)
+                #continue
+            #else:
+                #print("continuing2 " + dir_printable)
+                #foo=os.lstat(dir_printable)
+                #continue
+
             #print("==> entering " + dir)
             #time.sleep(0.2)
             if dir in dirsizes: # and dir in dirxxh
@@ -241,15 +263,13 @@ class DDB():
             dirsize=0 # size of current dir including subdirs
             res=[] # dir contents to insert (all at once for performance) in the DB
             for _file in files:
-                try:
-                    file=_file.decode('utf-8')
-                except UnicodeDecodeError:
-                    file=_file.decode('8859')
+                file,file_printable = mydecode_path(_file)
                 #print(chardet.detect(_file))
                 if file=='.DS_Store':
                     continue
                 path = dir + "/" + file
-                foo = cur.execute("select size from files where path=?", (path,)).fetchall()
+                path_printable = dir_printable + "/" + file_printable
+                foo = cur.execute("select size from files where path=?", (path_printable,)).fetchall()
                 if len(foo)>0:
                     print('Error: file ' + path + ' already in DB !' + str(foo[0]))
                     continue
@@ -261,7 +281,7 @@ class DDB():
                     ltarget = os.readlink(path)
                     lxxh = xxhash.xxh64(file + ' -> ' + ltarget).intdigest() - (1<<63)
                     dircontents.append(lxxh)
-                    cur.execute('insert or replace into symlinks values (null,?,?,?,?,?,?,?)', (dir.replace(init_path, ''), file, path.replace(init_path, ''), ltarget, 0, lxxh, param_id))
+                    cur.execute('insert or replace into symlinks values (null,?,?,?,?,?,?,?)', (dir_printable.replace(init_path, ''), file_printable, path_printable.replace(init_path, ''), ltarget, 0, lxxh, param_id))
                     continue
                 filestat = os.lstat(path)
                 filesize = int(filestat.st_size)
@@ -273,7 +293,7 @@ class DDB():
                 mymagicid=self.magicid(path)
                 #bisect.insort(dircontents[dir], xxh)
                 dircontents.append(xxh)
-                res.append(( None, dir.replace(init_path, ''), file, path.replace(init_path, ''), filesize, xxh,
+                res.append(( None, dir_printable.replace(init_path, ''), file_printable, path_printable.replace(init_path, ''), filesize, xxh,
                     int(filestat.st_mtime), filestat.st_mode, filestat.st_uid, filestat.st_gid, filestat.st_ino, filestat.st_nlink, filestat.st_dev, param_id, mymagicid
                 ))
                 #reslen= '(' + '?,' * (len(res)-1) + '?)'
@@ -291,29 +311,27 @@ class DDB():
                     aflag=True
 
                 if mytime2-mytime1>0.2:
-                    sys.stderr.write("\033[2K\rScanning: [%d MB, %d files] %s" % (processedsize>>20, processedfiles, dir.replace(init_path, '')))
+                    sys.stderr.write("\033[2K\rScanning: [%d MB, %d files] %s" % (processedsize>>20, processedfiles, dir_printable.replace(init_path, '')))
                     sys.stderr.flush()
                     #conn.commit()
                     mytime1=mytime2
 
             for _mydir in dirs:
-                try:
-                    mydir=_mydir.decode('utf-8')
-                except UnicodeDecodeError:
-                    mydir=_mydir.decode('8859')
+                mydir,mydir_printable = mydecode_path(_mydir)
                 mypath=dir+'/'+mydir
+                mypath_printable=dir_printable+'/'+mydir_printable
                 if os.path.islink(mypath):
                     ltarget = os.readlink(mypath)
                     lxxh = xxhash.xxh64(mydir + ' -> ' + ltarget).intdigest() - (1<<63)
                     dircontents.append(lxxh)
-                    cur.execute('insert or replace into symlinks values (null,?,?,?,?,?,?,?)', (dir.replace(init_path, ''), mydir, mypath.replace(init_path, ''), ltarget, 1, lxxh, param_id))
+                    cur.execute('insert or replace into symlinks values (null,?,?,?,?,?,?,?)', (dir_printable.replace(init_path, ''), mydir_printable, mypath_printable.replace(init_path, ''), ltarget, 1, lxxh, param_id))
                     #print('dir symlink !')
                 elif mypath in dirxxh and mypath in dirsizes:
                     dircontents.append(dirxxh[mypath])
                     dirsize += dirsizes[mypath]
                     #print(mypath + " OK")
                 else: #if we do bottom-up, all subdirs are processed before the current dir so this should never happen
-                    print("Problem : " + mypath + " not precomputed")
+                    print("Problem : " + mypath_printable + " not precomputed")
                     # FIXME: handle access rights
                     #rs = cur.execute("select xxh64be,size from dirs where parentdir='%s' and name in %s" % (dir, "('"+"','".join(dirs)+"')"))
                     #rs = cur.execute("select xxh64be,size from dirs where parentdir=? and name=?", (dir, mydir))
@@ -339,7 +357,7 @@ class DDB():
             #bisect.insort(dircontents[os.path.dirname(dir)], dirxxh)
             dirstat = os.lstat(dir)
             resdir = (
-                None, os.path.dirname(dir).replace(init_path, ''), os.path.basename(dir), dir.replace(init_path, ''), dirsize, len(files), len(dirs), dxxh,
+                None, os.path.dirname(dir_printable).replace(init_path, ''), os.path.basename(dir_printable), dir_printable.replace(init_path, ''), dirsize, len(files), len(dirs), dxxh,
                 int(dirstat.st_mtime), dirstat.st_mode, dirstat.st_uid, dirstat.st_gid, dirstat.st_nlink, dirstat.st_dev, param_id
             )
             reslen2 =  '(' + '?,' * (len(resdir)-1) + '?)'
@@ -401,19 +419,41 @@ class DDB():
         cur = self.conn.cursor()
         cur2 = self.conn.cursor()
         rs = cur.execute("select name,xxh64be,size,path from files where size>0 and path like ? order by path", (path_test+'/%',))
+        if not rs:
+            print('No results !')
         for line in rs:
             name,xxh,size,path=line
             if excluded!="" and excluded in path:
                 continue
             rs2=cur2.execute("select path from files where xxh64be=? and size=? and path like ?", (xxh, size, path_ref+'/%')).fetchall()
             if len(rs2)==0:
-                print("___ %s has no equivalent" % (path))
+                print("%s has no equivalent" % (path))
             #else:
             #    print("________ %s has %s equivalents" % (path, len(rs2)))
                 #sys.stdout.write('.')
                 #pass
             #time.sleep(0.1)
 
+    def diff(self,dir1,dir2):
+        self.isincluded(dir1,dir2)
+        self.isincluded(dir2,dir1)
+
+    def diffrec(self,dir1,dir2):
+        cur = self.conn.cursor()
+        cur2 = self.conn.cursor()
+        files = cur.execute("select name,xxh64be,size,path from files where size>0 and parentdir=? order by path", (dir1,))
+        for line in files:
+            name,xxh,size,path=line
+            rs2=cur2.execute("select path from files where xxh64be=? and size=? and parent=?", (xxh, size, dir2)).fetchall()
+            if len(rs2)==0:
+                print("%s has no equivalent" % (path))
+
+        dirs = cur.execute("select name,xxh64be,size,path from dirs where size>0 and parentdir=? order by path", (dir1,))
+        for line in files:
+            name,xxh,size,path=line
+            rs2=cur2.execute("select path from files where xxh64be=? and size=? and parent=?", (xxh, size, dir2)).fetchall()
+            if len(rs2)==0:
+                print("%s has no equivalent" % (path))
 
 
 ######################################################
@@ -525,7 +565,7 @@ class DDBfs(Operations):
             st[k] = rs[0][v]
         st['st_atime']=0
         st['st_ctime']=0
-        st['st_blocks'] = math.ceil(st['st_size']/512)
+        st['st_blocks'] = math.ceil(st['st_size']/512) # By the way, it may seem obvious to the reader but I discovered that in some situations files can have identical contents/size/filename and yet have a different size returned by "du -s" (but identical size returned with "du -sb". Another way to see it is to compare with find -type f -printf "%8b %10s\t%p\n" and see that number of blocks differ despite real size is identical). This is because the default behavior for du is to rely on st_block, which may differ between identical files if the underlying filesystem is fragmented while du -b uses st_size i.e. the real file size
         if stat.S_ISREG(st['st_mode']):
             st['st_size'] = len(fakecontents(rs[0][7],rs[0][0]))
         return st
