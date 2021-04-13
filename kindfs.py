@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Author: Adrien Demarez (adrien.demarez@free.fr)
-# Version: 20201121
+# Version: 20210411
 # License: GPLv3
-# Prerequisite : pip install xxhash numpy fusepy
+# Prerequisite : pip install xxhash numpy fusepy python-magic
 # Beware : this software only hashes portions of files for speed (and therefore may consider that some files/dirs are identical when they are not really). Use this program at your own risk and only when you know what you are doing !
 
 import sqlite3,xxhash
@@ -35,10 +35,7 @@ def xxhash_file(filename, filesize=None, chunksize=1<<20, inclsize=False, inclna
     """Return pseudo-hash of a file using xxhash64 on 3 MBytes of that file at its beginning/middle/end. Optionally include the size and filename into the pseudo-hash"""
     if filesize==None:
         filesize=int(os.stat(filename).st_size)
-    if chunksize==None: # default value == 1<<20 i.e. 1 MByte chunk size
-        CHUNKSIZE=filesize
-    else:
-        CHUNKSIZE=chunksize
+    CHUNKSIZE=filesize if chunksize==None else chunksize # default value == 1<<20 i.e. 1 MByte chunk size
     digest = xxhash.xxh64()
     if inclsize==True:
         digest.update(filesize)
@@ -57,6 +54,8 @@ def xxhash_file(filename, filesize=None, chunksize=1<<20, inclsize=False, inclna
 
 def mydecode_path(pathbytes,fixparts=False):
     # In worst cases, there may be a mix of encoding in the path (e.g. beginning as utf8, and starting from some point some subdirs as iso8859, and deeper in the path again some utf8). The best way would be to use convmv to fix the issue before running this script. However in real life there may not always be a way to fix the data prior to processing, and I don't want the script to fail miserably in those cases => therefore here we return two decoded string : a first string with "surrogateescape" that can be used by os.* file methods (but cannot be printed or really used as string), and another string which cannot be used by file methods (it doesn't correspond to a valid path on the filesystem) but can be printed and manipulated (and inserted in the DB). For the latter, there are two options : either use error="replace" (default behavior), or fix every subsection of the path (slower, will convert every part nicely to utf8 for printing, but will also hide under the carpet that there is an issue that deserves to be fixed with convmv on this section of the filesystem)
+    # TODO: check os.fsdecode() ?
+    #print(chardet.detect(pathbytes))
     if fixparts:
         pathlist=pathbytes.split(b'/')
         path_decoded=""
@@ -171,10 +170,7 @@ class DDB():
     def magicid(self, path, domime=True):
         if self.domagic==False:
             return 0
-        if domime==True:
-            magictype = magic.from_file(path, mime=True)
-        else:
-            magictype = re.sub(', BuildID\[sha1\]=[0-9a-f]*','',magic.from_file(path))
+        magictype = magic.from_file(path, mime=True) if domime==True else re.sub(', BuildID\[sha1\]=[0-9a-f]*','',magic.from_file(path))
         if magictype in self.magictypes:
             return self.magictypes[magictype]
         cur = self.conn.cursor()
@@ -204,8 +200,7 @@ class DDB():
         if processedsize==None:
             processedsize=0
 
-        rs = cur.execute("select parentdir,name,xxh64be,size from dirs where xxh64be is not null")
-        for k in rs:
+        for k in cur.execute("select parentdir,name,xxh64be,size from dirs where xxh64be is not null"):
             parentdir,name,xxh,dirsize = k
             curdir=parentdir+'/'+name
             dirxxh[curdir]=xxh
@@ -217,8 +212,7 @@ class DDB():
             #         print("___ " + str((curdir,allsize4,dirsize)))
 
         if self.domagic==True:
-            rs = cur.execute('select id,magictype from magictypes')
-            for line in rs:
+            for line in cur.execute('select id,magictype from magictypes'):
                 magicid,magictype = line
                 self.magictypes[magictype] = magicid
 
@@ -227,32 +221,16 @@ class DDB():
         cur.execute('insert or replace into dbsessions values (null, ?,?)', (int(mytime1), init_path))
         param_id=cur.lastrowid
         for (_dir, dirs, files) in os.walk(bytes(init_path, encoding='utf-8'), topdown=False):
-            # FIXME: what happens if part of the path is utf-8 and another part of the path is 8859 ? => do proper convmv before
-            #_dir2=os.fsdecode(_dir)
-            #_dir=os.fsencode(_dir2)
             dir,dir_printable = mydecode_path(_dir)
-
-            #if _dir==bytes("/mnt/usb12t/_disks/x200_papa_20200612/jacques/_oldsave/Tera", encoding='utf-8'):
-                #print("skipping2 " + dir_printable)
-                #continue
-            #else:
-                #print("continuing2 " + dir_printable)
-                #foo=os.lstat(dir_printable)
-                #continue
-
             #print("==> entering " + dir)
             #time.sleep(0.2)
             if dir in dirsizes: # and dir in dirxxh
-            #    processedsize += dirsizes[dir]
+                #processedsize += dirsizes[dir]
                 #print (dir + "already in DB -> skipping")
                 continue
             #else:
-                #allsize4 = cur2.execute("select sum(size) from files where parentdir=?", [dir]).fetchall()[0][0]
-                #dirsizes[dir]=allsize4
-                #print((dir,dirsizes[dir],allsize4))
-                #print('\n\n')
+                #dirsizes[dir] = cur2.execute("select sum(size) from files where parentdir=?", [dir]).fetchall()[0][0]
 
-            #dircontents[dir] = np.array([],dtype=np.int64)
             #progress.update(dir, dirs, files)
             for excludetest in option_excludelist:
                 if fnmatch.fnmatch(dir, excludetest):
@@ -264,14 +242,14 @@ class DDB():
             res=[] # dir contents to insert (all at once for performance) in the DB
             for _file in files:
                 file,file_printable = mydecode_path(_file)
-                #print(chardet.detect(_file))
                 if file=='.DS_Store':
                     continue
                 path = dir + "/" + file
                 path_printable = dir_printable + "/" + file_printable
-                foo = cur.execute("select size from files where path=?", (path_printable,)).fetchall()
-                if len(foo)>0:
-                    print('Error: file ' + path + ' already in DB !' + str(foo[0]))
+                alreadythere = cur.execute("select size from files where path=?", (path_printable,)).fetchall()
+                if len(alreadythere)>0:
+                    print('Error: file ' + path + ' already in DB !' + str(alreadythere[0]))
+                    # FIXME: add size to dirsize and xxh to dircontents ?
                     continue
                 if not os.path.exists(path) or not os.access(path, os.R_OK) or not os.path.isfile(path):
                     # Skip broken symlinks, and cases where we do not have access rights. TODO: check whether access rights are tied to inode or path
@@ -299,7 +277,6 @@ class DDB():
                 #reslen= '(' + '?,' * (len(res)-1) + '?)'
                 #cur.execute('insert or replace into files values ' + reslen, res)
 
-                #print("==> adding " + path)
                 #sys.stderr.write("\033[2K\r%s\rScanning: [%d %%, %d MB, %d files] %s" % (" " * 500, 100*processedsize/totalsize/1024, processedsize>>20, processedfiles, path))
                 #progress.updatef()
                 mytime2=time.time()
@@ -325,11 +302,9 @@ class DDB():
                     lxxh = xxhash.xxh64(mydir + ' -> ' + ltarget).intdigest() - (1<<63)
                     dircontents.append(lxxh)
                     cur.execute('insert or replace into symlinks values (null,?,?,?,?,?,?,?)', (dir_printable.replace(init_path, ''), mydir_printable, mypath_printable.replace(init_path, ''), ltarget, 1, lxxh, param_id))
-                    #print('dir symlink !')
                 elif mypath in dirxxh and mypath in dirsizes:
                     dircontents.append(dirxxh[mypath])
                     dirsize += dirsizes[mypath]
-                    #print(mypath + " OK")
                 else: #if we do bottom-up, all subdirs are processed before the current dir so this should never happen
                     print("Problem : " + mypath_printable + " not precomputed")
                     # FIXME: handle access rights
@@ -339,21 +314,12 @@ class DDB():
                     #    dircontents.append(k[0])
                     #    dirsize += k[1]
 
-            # Increment all parents dir size with current dir size
-            #dirtmp=dir
-            #while(dirsize > 0 and dirtmp != init_path and dirtmp != '/'):
-            #     dirsizes[dirtmp] += dirsize
-            #     dirtmp = os.path.dirname(dirtmp)
-
-        #for (dir, dirs, files) in os.walk(init_path, topdown=False):
             # Compute "directory hash"
-            foo = np.array(dircontents, dtype=np.int64)
-            foo.sort()
-            dxxh = xxhash.xxh64(foo.tobytes()).intdigest() - (1<<63)
+            npdircontents = np.array(dircontents, dtype=np.int64)
+            npdircontents.sort()
+            dxxh = xxhash.xxh64(npdircontents.tobytes()).intdigest() - (1<<63)
             dirxxh[dir] = dxxh
             dirsizes[dir] = dirsize
-            #if (parentdir != '/'):
-            #    dircontents[parentdir].append(dirxxh)
             #bisect.insort(dircontents[os.path.dirname(dir)], dirxxh)
             dirstat = os.lstat(dir)
             resdir = (
@@ -364,10 +330,8 @@ class DDB():
             #conn.execute('BEGIN')
             cur.execute('insert or replace into dirs values ' + reslen2, resdir)
             if len(res)>0:
-                #print(str(res[0]) + '\n_____\n')
                 reslen= '(' + '?,' * (len(res[0])-1) + '?)'
                 cur.executemany('insert or replace into files values ' + reslen, res)
-
             #     conn.rollback()
             # else:
             #     conn.commit()
@@ -382,8 +346,8 @@ class DDB():
     def detectsubdups(self, dir1,dir2):
         cur1 = self.conn.cursor()
         cur2 = self.conn.cursor()
-        rs1 = cur1.execute("select parentdir,name,xxh64be,size from dirs where parentdir like '%s%%' order by parentdir,name" %(dir1))
-        rs2 = cur2.execute("select parentdir,name,xxh64be,size from dirs where parentdir like '%s%%' order by parentdir,name" %(dir2))
+        rs1 = cur1.execute("select parentdir,name,xxh64be,size from dirs where parentdir like ? order by parentdir,name", (dir1+'%',))
+        rs2 = cur2.execute("select parentdir,name,xxh64be,size from dirs where parentdir like ? order by parentdir,name", (dir2+'%',))
         while True:
             line1=rs1.fetchone()
             line2=rs2.fetchone()
@@ -403,10 +367,8 @@ class DDB():
                 print(foo1 + ' | ' + foo2 + ' -> ' + pdir1)
 
     def dumpdir(self, adir):
-        print(len(adir))
         cur = self.conn.cursor()
-        rs = cur.execute("select path,xxh64be,size from dirs where path like '%s%%' order by path" % (adir))
-        for line in rs:
+        for line in cur.execute("select path,xxh64be,size from dirs where path like ? order by path", (adir+'/%',)):
             (path,xxh64be,size) = line
             print("0x%016x, %d : %s" % (xxh64be+(1<<63), size, path.replace(adir,'')))
 
@@ -414,11 +376,18 @@ class DDB():
         cur = self.conn.cursor()
         return cur.execute("select sum(size) from files").fetchall()[0][0]
 
-    def isincluded(self, path_test, path_ref, excluded=""):
+    def isincluded(self, path_test, path_ref, otherddbfs=None, excluded=""):
         """Checks whether every file under path_test/ (and subdirs) has a copy somewhere in path_ref (regardless of the directory structure in path_ref/ )"""
         cur = self.conn.cursor()
-        cur2 = self.conn.cursor()
-        rs = cur.execute("select name,xxh64be,size,path from files where size>0 and path like ? order by path", (path_test+'/%',))
+        flag=True
+        if otherddbfs:
+            conn2 = sqlite3.connect(otherddbfs)
+            cur2 = conn2.cursor()
+        else:
+            cur2 = self.conn.cursor()
+        mycount=cur.execute("select count(*) from (select name,xxh64be,size,path from files where size>0 and path like ? order by size desc)", (path_test+'/%',)).fetchone()[0]
+        rs = cur.execute("select name,xxh64be,size,path from files where size>0 and path like ? order by size desc", (path_test+'/%',))
+        k=1
         if not rs:
             print('No results !')
         for line in rs:
@@ -427,12 +396,17 @@ class DDB():
                 continue
             rs2=cur2.execute("select path from files where xxh64be=? and size=? and path like ?", (xxh, size, path_ref+'/%')).fetchall()
             if len(rs2)==0:
-                print("%s has no equivalent" % (path))
+                print(f"\033[2K\rNo equivalent for ({size>>20} Mo) : {path} ")
+                flag=False
             #else:
-            #    print("________ %s has %s equivalents" % (path, len(rs2)))
+                #print("________ %s has %s equivalents" % (path, len(rs2)))
                 #sys.stdout.write('.')
-                #pass
-            #time.sleep(0.1)
+            sys.stderr.write("\033[2K\rScanning: [%d / %d entries] " % (k,mycount))
+            sys.stderr.flush()
+            k+=1
+        if otherddbfs:
+            conn2.close()
+        return flag
 
     def diff(self,dir1,dir2):
         self.isincluded(dir1,dir2)
@@ -469,24 +443,16 @@ class DDBfs(Operations):
         self.init_path=init_path
         cur = self.conn.cursor()
         self.mkdir = {}
-        rs=cur.execute("select path from postops where op='mkdir'")
-        for k in rs:
-            src=k
+        for src in cur.execute("select path from postops where op='mkdir'"):
             self.mkdir[src]=''
         self.rename = {}
-        rs=cur.execute("select path,arg from postops where op='rename'")
-        for k in rs:
-            src,dst=k
+        for src,dst in cur.execute("select path,arg from postops where op='rename'"):
             self.rename[src]=dst
         self.unlink = {}
-        rs=cur.execute("select path from postops where op='unlink'")
-        for k in rs:
-            src=k
+        for src in cur.execute("select path from postops where op='unlink'"):
             self.unlink[src]=''
         self.rmdir = {}
-        rs=cur.execute("select path from postops where op='rmdir'")
-        for k in rs:
-            src=k
+        for src in cur.execute("select path from postops where op='rmdir'"):
             self.rmdir[src]=''
 
     #@logme
@@ -495,17 +461,17 @@ class DDBfs(Operations):
         #print('readdir ' + path)
         cur = self.conn.cursor()
         res=['.', '..']
-        rs1 = cur.execute("select name from dirs where parentdir='%s'" % (path)).fetchall()
+        rs1 = cur.execute("select name from dirs where parentdir=?", (path,)).fetchall()
         for k in rs1:
             if k[0]=='':
                 continue
             res.append(k[0])
-        rs2 = cur.execute("select name from files where parentdir='%s'" % (path)).fetchall()
+        rs2 = cur.execute("select name from files where parentdir=?", (path,)).fetchall()
         for k in rs2:
             if k[0]=='':
                 continue
             res.append(k[0])
-        rs3 = cur.execute("select name from symlinks where parentdir='%s'" % (path)).fetchall()
+        rs3 = cur.execute("select name from symlinks where parentdir=?", (path,)).fetchall()
         for k in rs3:
             if k[0]=='':
                 continue
@@ -518,7 +484,7 @@ class DDBfs(Operations):
     def open(self, path1, flags):
         path=path1.replace("/", self.init_path, 1).rstrip('/').replace("'","''")
         cur = self.conn.cursor()
-        rs = cur.execute("select xxh64be from files where path='%s'" % (path)).fetchall()
+        rs = cur.execute("select xxh64be from files where path=?", (path,)).fetchall()
         if not rs:
             print("open: error " + path)
             return -errno.ENOENT
@@ -529,34 +495,30 @@ class DDBfs(Operations):
         path=path1.replace("/", self.init_path, 1).rstrip('/').replace("'","''")
         #print('read %s : %d' % (path, size))
         cur = self.conn.cursor()
-        rs = cur.execute("select xxh64be,size from files where path='%s'" % (path)).fetchall()
+        rs = cur.execute("select xxh64be,size from files where path=?", (path,)).fetchall()
         if not rs:
             print("read: error " + path)
             return -errno.ENOENT
         return fakecontents(rs[0][0], rs[0][1])[offset:offset+size]
-        #foo = "0x%016x, %d\n" % (rs[0][0]+(1<<63), rs[0][1]) # %20d
-        #foob = bytes(foo[offset:offset+size], encoding='utf8')
         #if size>len(foob):
         #    foob += bytes('\0', encoding='utf8') * (size-len(foob))
         #return foob.ljust(size,'\0')
 
     #@logme
     def getattr(self, path1, fh=None):
-        path=path1.replace("/", self.init_path, 1).rstrip('/').replace("'","''")
-        #print('getattr %s' % (path))
         if path1=='/' or path1.startswith('/.Trash'):
-            #print('getattr: ' + path)
             st={}
             for k in 'st_size', 'st_mtime', 'st_uid', 'st_gid', 'st_dev', 'st_ino', 'st_nlink', 'st_atime', 'st_ctime':
                 st[k] = 1000
-                st['st_mode'] = stat.S_IFDIR | 0o755
+            st['st_mode'] = stat.S_IFDIR | 0o755
             return st
+        path=path1.replace("/", self.init_path, 1).rstrip('/').replace("'","''")
         cur = self.conn.cursor()
-        rs = cur.execute("select size, st_mtime, st_mode, st_uid, st_gid, st_dev, xxh64be as st_ino, 2 as st_nlink from dirs where path='%s'" % (path)).fetchall()
+        rs = cur.execute("select size, st_mtime, st_mode, st_uid, st_gid, st_dev, xxh64be as st_ino, 2 as st_nlink from dirs where path=?", (path,)).fetchall()
         if not rs:
-            rs = cur.execute("select size, st_mtime, st_mode, st_uid, st_gid, st_dev, xxh64be as st_ino, st_nlink, xxh64be from files where path='%s'" % (path)).fetchall() # FIXME: should I leave the real st_ino ?
+            rs = cur.execute("select size, st_mtime, st_mode, st_uid, st_gid, st_dev, xxh64be as st_ino, st_nlink, xxh64be from files where path=?", (path,)).fetchall() # FIXME: should I leave the real st_ino ?
         if not rs:
-            rs = cur.execute("select 0 as size, 0 as st_mtime, %d as st_mode, 1000 as st_uid, 1000 as st_gid, 0 as st_dev, xxh64be as st_ino, 1 as st_nlink from symlinks where path='%s'" % (stat.S_IFLNK | 0o755, path)).fetchall()
+            rs = cur.execute("select 0 as size, 0 as st_mtime, ? as st_mode, 1000 as st_uid, 1000 as st_gid, 0 as st_dev, xxh64be as st_ino, 1 as st_nlink from symlinks where path=?", (stat.S_IFLNK | 0o755, path)).fetchall()
         if not rs:
             return -errno.ENOENT
 
@@ -574,7 +536,7 @@ class DDBfs(Operations):
     def readlink(self,path1):
         path=path1.replace("/", self.init_path, 1).rstrip('/').replace("'","''")
         cur = self.conn.cursor()
-        rs = cur.execute("select target from symlinks where path='%s'" % (path)).fetchall()
+        rs = cur.execute("select target from symlinks where path=?", (path,)).fetchall()
         return rs[0][0]
 
     #@logme
@@ -638,8 +600,11 @@ if __name__ == "__main__":
         ddb.conn.commit()
         ddb.conn.close()
     elif opmode=='DUMP':
-        ddb=DDB(dbname, basedir)
+        ddb=DDB(dbname)
         ddb.dumpdir(basedir)
+    elif opmode=='ISINCLUDED':
+        ddb=DDB(dbname)
+        ddb.isincluded(basedir,sys.argv[4],sys.argv[5])
     elif opmode=='FUSEFS':
         FUSE(DDBfs(dbname), basedir, nothreads=True, foreground=True)
     else:
