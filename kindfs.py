@@ -17,6 +17,7 @@ import time
 from fuse import FUSE, Operations #FuseOSError
 import magic
 import re
+from termcolor import colored
 
 #import bisect
 #import chardet
@@ -242,7 +243,7 @@ class DDB():
             res=[] # dir contents to insert (all at once for performance) in the DB
             for _file in files:
                 file,file_printable = mydecode_path(_file)
-                if file=='.DS_Store':
+                if file=='.DS_Store' or file=='._.DS_Store':
                     continue
                 path = dir + "/" + file
                 path_printable = dir_printable + "/" + file_printable
@@ -337,11 +338,153 @@ class DDB():
             #     conn.commit()
         print('\nDone')
 
-    def computedups(self):
-        # select * from dirs where xxh64be in (select xxh64be from dirs group by xxh64be having count(*)>1) order by size desc
+    def computedups(self,basedir="/mnt/raid",dirsorfiles="dirs", wherepathlike='/%'):
         # select (dups-1)*size/1048576 as sz, * from dirdups where not parentdir in (select path from dirdups)
         cur = self.conn.cursor()
-        cur.execute('create table dirdups as select dirs.*, foo.dups from dirs inner join (select count(*) as dups, xxh64be from dirs group by xxh64be having count(*)>1) foo on dirs.xxh64be=foo.xxh64be')
+        cur2 = self.conn.cursor()
+        print("Computing duplicates...")
+        cur.executescript(f'''
+            create temp table tmp(parentdir text, path text, xxh64be integer, size integer, dups integer);
+            insert into tmp select parentdir,path,xxh64be,size,foo.dups from {dirsorfiles} inner join (select count(*) as dups, xxh64be as xxh from {dirsorfiles} group by xxh64be having count(*)>1) foo on {dirsorfiles}.xxh64be=xxh where path like '{wherepathlike}';
+            create index tmp_parentdir_idx on tmp(parentdir);
+            create index tmp_path_idx on tmp(path);
+            create index tmp_xxh64be_idx on tmp(xxh64be);
+            create index tmp_size_idx on tmp(size);
+        ''')
+        print("Second phase")
+        rs = cur.execute('select xxh64be,size,dups from tmp where parentdir not in (select path from tmp) group by xxh64be order by size desc limit 50')
+        for xxh,size,dups in rs:
+            rs2=cur2.execute(f'select path from {dirsorfiles} where xxh64be=?', (xxh,)).fetchall()
+            paths = []
+            l=0
+            for k in rs2:
+                if basedir!='':
+                    mystr = basedir+k[0] if os.path.exists(basedir+k[0]) else colored(basedir+k[0], 'red')
+                    l += 1 if os.path.exists(basedir+k[0]) and not "syncthing" in (basedir+k[0]) else 0
+                    paths.append(mystr)
+                elif not 'syncthing' in k[0] and not 'lost+found' in k[0]:
+                    mystr=k[0]
+                    l+=1
+                    paths.append(mystr)
+            if l>1:
+                print(colored("0x%016x, %d * %d Mo :" % (xxh+(1<<63), dups, size>>20), 'yellow'))
+                print('\t'+'\n\t'.join(paths))
+        #rs = cur.execute('select * from tmp where parentdir not in (select path from tmp) order by size desc limit 100')
+        #for line in rs:
+            #parentdir,path,xxh,size,dups = line
+            #mystr="0x%016x, %d Mo : %s" % (xxh+(1<<63), size>>20, path)
+            #if os.path.exists(basedir+path):
+                #print(mystr)
+            #else:
+                #print (colored(mystr, 'red'))
+
+    def walk(self,init_path):
+        cur = self.conn.cursor()
+        cur2 = self.conn.cursor()
+        for res in cur.execute('select path from dirs where path like ? order by path',(init_path+'/%',)):
+            dir=res[0]
+            dirs = [k[0] for k in cur2.execute('select name from dirs where parentdir=?',(dir,))]
+            files = [k[0] for k in cur2.execute('select name from files where parentdir=?',(dir,))]
+            yield dir,dirs,files
+
+    def getincluded(self,basedir="/mnt/raid", init_path="/mnt/raid", wherepathlike='/%', resetdb=False):
+        cur = self.conn.cursor()
+        print("Computing duplicates...")
+        if resetdb:
+            cur.executescript(f'''
+                drop table if exists tmp;
+                create table tmp(parentdir text, path text, xxh64be integer, size integer, dups integer, atype integer);
+                insert into tmp select parentdir,path,xxh64be,size,foo.dups,0 from dirs inner join (select count(*) as dups, xxh64be as xxh from dirs group by xxh64be having count(*)>1) foo on dirs.xxh64be=xxh where path like '{wherepathlike}';
+                insert into tmp select parentdir,path,xxh64be,size,foo.dups,1 from files inner join (select count(*) as dups, xxh64be as xxh from files group by xxh64be having count(*)>1) foo on files.xxh64be=xxh where path like '{wherepathlike}';
+                create index tmp_parentdir_idx on tmp(parentdir);
+                create index tmp_path_idx on tmp(path);
+                create index tmp_xxh64be_idx on tmp(xxh64be);
+                create index tmp_size_idx on tmp(size);
+            ''')
+        cur.executescript('''
+                drop table if exists tmp2;
+                create temp table tmp2 (path text, size integer,ndupdirs integer,nsubdirs integer,ndupfiles integer, nsubfiles integer);
+                create index tmp2_path_idx on tmp2(path);
+                create index tmp2_size_idx on tmp2(size);
+        ''')
+        print("Finished first part")
+        cur2 = self.conn.cursor()
+        c=cur.execute('select count(*) from dirs where path like ? order by path',(basedir[len(init_path):]+'/%',)).fetchone()[0]
+        k=0
+        for dir,nsubdirs,nsubfiles,size in cur.execute('select path,nsubdirs,nsubfiles,size from dirs where path like ? order by path',(basedir[len(init_path):]+'/%',)):
+            ndupdirs=cur2.execute('select count(*) from tmp where parentdir=? and atype=0',(dir,)).fetchone()[0]
+            ndupfiles=cur2.execute('select count(*) from tmp where parentdir=? and atype=1',(dir,)).fetchone()[0]
+            if ndupdirs>0.8*nsubdirs or ndupfiles>0.8*nsubfiles:
+                sizedupd=0
+                for line in cur2.execute('select * from tmp where atype=1 and parentdir=? or parentdir in (select path from dirs where parentdir=?)',(dir,dir)): # FIXME: does not include the size of subdirs / incorrect size
+                    parentdir, path, xxh64be, asize, dups, atype = line
+                    if not basedir in path:
+                        sizedupd+=asize
+                #print((dir,size,ndupdirs,nsubdirs,ndupfiles,nsubfiles))
+                cur2.execute('insert into tmp2 values (?,?,?,?,?,?)', (dir,sizedupd>>20,ndupdirs,nsubdirs,ndupfiles,nsubfiles))
+            k+=1
+            sys.stderr.write("\033[2K\rScanning: [%d / %d]" % (k,c)) ; sys.stderr.flush()
+        print()
+        for line in cur.execute("select * from tmp2 order by size desc limit 30"):
+            print(line)
+
+
+    def getincluded2(self,basedir="/mnt/raid", init_path="/mnt/raid",wherepathlike='/%'):
+        cur = self.conn.cursor()
+        print("Computing duplicates...")
+        cur.executescript(f'''
+            drop table if exists tmp;
+            create temp table tmp(parentdir text, path text, xxh64be integer, size integer, dups integer, atype integer);
+            insert into tmp select parentdir,path,xxh64be,size,foo.dups,0 from dirs inner join (select count(*) as dups, xxh64be as xxh from dirs group by xxh64be having count(*)>1) foo on dirs.xxh64be=xxh where path like '{wherepathlike}';
+            insert into tmp select parentdir,path,xxh64be,size,foo.dups,1 from files inner join (select count(*) as dups, xxh64be as xxh from files group by xxh64be having count(*)>1) foo on files.xxh64be=xxh where path like '{wherepathlike}';
+            create index tmp_parentdir_idx on tmp(parentdir);
+            create index tmp_path_idx on tmp(path);
+            create index tmp_xxh64be_idx on tmp(xxh64be);
+            create index tmp_size_idx on tmp(size);
+
+            drop table if exists tmp2;
+            create temp table tmp2(path text, size integer, atype integer);
+            create index tmp2_path_idx on tmp2(path);
+            create index tmp2_size_idx on tmp2(size);
+        ''')
+        print("Finished SQL part")
+        res={}
+        k=0
+        for (_dir, dirs, files) in os.walk(bytes(basedir, encoding='utf-8'), topdown=False):
+            dir,dir_printable = mydecode_path(_dir)
+            res_cur=[0,0,0,0,0,0]
+            for _file in files:
+                res_cur[0] += 1
+                file,file_printable = mydecode_path(_file)
+                if file=='.DS_Store' or file=='._.DS_Store':
+                    continue
+                path = dir + "/" + file
+                path_printable = dir_printable + "/" + file_printable
+                alreadythere = cur.execute("select size from tmp where path=? and atype=1", (path_printable[len(init_path):],)).fetchall()
+                if len(alreadythere)>0:
+                    res_cur[1] += 1
+                    res_cur[4] = alreadythere[0][0]
+                    cur.execute('insert into tmp2 values(?,?,1)', (path_printable[len(init_path):],alreadythere[0][0]))
+            for _mydir in dirs:
+                res_cur[2]+=1
+                mydir,mydir_printable = mydecode_path(_mydir)
+                mypath=dir+'/'+mydir
+                mypath_printable=dir_printable+'/'+mydir_printable
+                alreadythere = cur.execute("select size from tmp where path=? and atype=0", (mypath_printable[len(init_path):],)).fetchall()
+                if len(alreadythere)>0:
+                    res_cur[3] += 1
+                    res_cur[5] = alreadythere[0][0]
+                    cur.execute('insert into tmp2 values(?,?,0)', (mypath_printable[len(init_path):],alreadythere[0][0]))
+            if (res_cur[1]>0.8*res_cur[0]) or (res_cur[3]>0.8*res_cur[2]):
+                res[dir]=res_cur
+            k+=1
+            sys.stderr.write("\033[2K\rScanning: [%d dirs] %s " % (k,dir)) ; sys.stderr.flush()
+        for k,v in res.items():
+            print(f'{k} : {v}')
+        rs=cur.execute('select * from tmp2 order by size desc limit 30')
+        for k in rs:
+            print(k)
+        return res
 
     def detectsubdups(self, dir1,dir2):
         cur1 = self.conn.cursor()
@@ -376,37 +519,49 @@ class DDB():
         cur = self.conn.cursor()
         return cur.execute("select sum(size) from files").fetchall()[0][0]
 
-    def isincluded(self, path_test, path_ref, otherddbfs=None, excluded=""):
+    def isincluded(self, path_test, path_ref, otherddbfs=None, excluded="",docount=True,displaytrue=False,basedir="/mnt/raid"): #basedir="/mnt/raid"
         """Checks whether every file under path_test/ (and subdirs) has a copy somewhere in path_ref (regardless of the directory structure in path_ref/ )"""
         cur = self.conn.cursor()
-        flag=True
         if otherddbfs:
             conn2 = sqlite3.connect(otherddbfs)
             cur2 = conn2.cursor()
         else:
             cur2 = self.conn.cursor()
-        mycount=cur.execute("select count(*) from (select name,xxh64be,size,path from files where size>0 and path like ? order by size desc)", (path_test+'/%',)).fetchone()[0]
-        rs = cur.execute("select name,xxh64be,size,path from files where size>0 and path like ? order by size desc", (path_test+'/%',))
+        mycount=cur.execute("select count(*) from (select name,xxh64be,size,path from files where size>0 and path like ? order by id)", (path_test+'/%',)).fetchone()[0] if docount else 1
+        rs = cur.execute("select name,xxh64be,size,path from files where size>0 and path like ? order by id", (path_test+'/%',))
         k=1
-        if not rs:
+        if not rs or mycount==0:
             print('No results !')
+        res = []
         for line in rs:
             name,xxh,size,path=line
             if excluded!="" and excluded in path:
                 continue
-            rs2=cur2.execute("select path from files where xxh64be=? and size=? and path like ?", (xxh, size, path_ref+'/%')).fetchall()
-            if len(rs2)==0:
-                print(f"\033[2K\rNo equivalent for ({size>>20} Mo) : {path} ")
-                flag=False
-            #else:
-                #print("________ %s has %s equivalents" % (path, len(rs2)))
-                #sys.stdout.write('.')
-            sys.stderr.write("\033[2K\rScanning: [%d / %d entries] " % (k,mycount))
-            sys.stderr.flush()
+            if not otherddbfs and path_ref=='':
+                rs2=cur2.execute("select path from files where xxh64be=? and size=? and not path like ?", (xxh, size, path_test+'/%')).fetchall()
+            else:
+                rs2=cur2.execute("select path from files where xxh64be=? and size=? and path like ?", (xxh, size, path_ref+'/%')).fetchall()
+            if not rs2:
+                print(colored(f"\033[2K\rNo equivalent for ({size>>20} Mo) : {path}",'yellow'))
+                res.append(path)
+            elif basedir!='':
+                # Let's check on the filesystem in case the duplicates would have been deleted compared to what's in the DB
+                l=0
+                for dup in rs2:
+                    if len(rs2)>20 or (not 'lost+found' in dup[0] and os.path.exists(basedir+dup[0])): # FIXME: "len(rs2)>20 or" is there because of performance issues with some results that have a large number of duplicates (e.g. small system/compilation files that are identical among many projects). But this workaround is suboptimal.
+                        l+=1
+                        break
+                if displaytrue and l!=0:
+                    print(colored(f"\033[2K\r{path} ({size>>20} Mo) has the equivalent: {rs2}",'green'))
+                if l==0:
+                    print(colored(f"\033[2K\rNo equivalent anymore for ({size>>20} Mo) : {path}",'red'))
+                    res.append(path)
+            sys.stderr.write("\033[2K\rScanning: [%d / %d entries] " % (k,mycount)) ; sys.stderr.flush()
             k+=1
         if otherddbfs:
             conn2.close()
-        return flag
+        #print('\n'.join(res))
+        return res
 
     def diff(self,dir1,dir2):
         self.isincluded(dir1,dir2)
@@ -457,7 +612,7 @@ class DDBfs(Operations):
 
     #@logme
     def readdir(self, path1, offset):
-        path=path1.replace("/", self.init_path, 1).rstrip('/').replace("'","''")
+        path=path1.replace("/", self.init_path, 1).rstrip('/')
         #print('readdir ' + path)
         cur = self.conn.cursor()
         res=['.', '..']
@@ -482,7 +637,7 @@ class DDBfs(Operations):
 
     #@logme
     def open(self, path1, flags):
-        path=path1.replace("/", self.init_path, 1).rstrip('/').replace("'","''")
+        path=path1.replace("/", self.init_path, 1).rstrip('/')
         cur = self.conn.cursor()
         rs = cur.execute("select xxh64be from files where path=?", (path,)).fetchall()
         if not rs:
@@ -492,7 +647,7 @@ class DDBfs(Operations):
 
     #@logme
     def read(self, path1, size, offset, fh=None):
-        path=path1.replace("/", self.init_path, 1).rstrip('/').replace("'","''")
+        path=path1.replace("/", self.init_path, 1).rstrip('/')
         #print('read %s : %d' % (path, size))
         cur = self.conn.cursor()
         rs = cur.execute("select xxh64be,size from files where path=?", (path,)).fetchall()
@@ -512,7 +667,7 @@ class DDBfs(Operations):
                 st[k] = 1000
             st['st_mode'] = stat.S_IFDIR | 0o755
             return st
-        path=path1.replace("/", self.init_path, 1).rstrip('/').replace("'","''")
+        path=path1.replace("/", self.init_path, 1).rstrip('/')
         cur = self.conn.cursor()
         rs = cur.execute("select size, st_mtime, st_mode, st_uid, st_gid, st_dev, xxh64be as st_ino, 2 as st_nlink from dirs where path=?", (path,)).fetchall()
         if not rs:
@@ -534,36 +689,36 @@ class DDBfs(Operations):
 
     #@logme
     def readlink(self,path1):
-        path=path1.replace("/", self.init_path, 1).rstrip('/').replace("'","''")
+        path=path1.replace("/", self.init_path, 1).rstrip('/')
         cur = self.conn.cursor()
         rs = cur.execute("select target from symlinks where path=?", (path,)).fetchall()
         return rs[0][0]
 
     #@logme
     def unlink(self, path1):
-        path=path1.replace("/", self.init_path, 1).rstrip('/').replace("'","''")
+        path=path1.replace("/", self.init_path, 1).rstrip('/')
         print('unlink %s' % (path))
         cur = self.conn.cursor()
         cur.execute('insert into postops values (null,?,?,?,?)', ('unlink', os.path.dirname(path), path, null))
 
     #@logme
     def rename(self, old, new):
-        src=old.replace("/", self.init_path, 1).rstrip('/').replace("'","''")
-        dst=new.replace("/", self.init_path, 1).rstrip('/').replace("'","''")
+        src=old.replace("/", self.init_path, 1).rstrip('/')
+        dst=new.replace("/", self.init_path, 1).rstrip('/')
         print('rename %s %s' % (src,dst))
         cur = self.conn.cursor()
         cur.execute('insert into postops values (null,?,?,?,?)', ('rename', os.path.dirname(src), src, dst))
 
     #@logme
     def mkdir(self, path1, mode):
-        path=path1.replace("/", self.init_path, 1).rstrip('/').replace("'","''")
+        path=path1.replace("/", self.init_path, 1).rstrip('/')
         print('mkdir %s' % (path))
         cur = self.conn.cursor()
         cur.execute('insert into postops values (null,?,?,?,?)', ('mkdir', os.path.dirname(path), path, null))
 
     #@logme
     def rmdir(self, path1):
-        path=path1.replace("/", self.init_path, 1).rstrip('/').replace("'","''")
+        path=path1.replace("/", self.init_path, 1).rstrip('/')
         print('rmdir %s' % (path))
         cur = self.conn.cursor()
         cur.execute('insert into postops values (null,?,?,?,?)', ('rmdir', os.path.dirname(path), path, null))
@@ -604,8 +759,15 @@ if __name__ == "__main__":
         ddb.dumpdir(basedir)
     elif opmode=='ISINCLUDED':
         ddb=DDB(dbname)
-        ddb.isincluded(basedir,sys.argv[4],sys.argv[5])
+        db2=sys.argv[5] if len(sys.argv)==6 else None
+        ddb.isincluded(basedir,sys.argv[4],db2)
     elif opmode=='FUSEFS':
         FUSE(DDBfs(dbname), basedir, nothreads=True, foreground=True)
+    elif opmode=='DUPS':
+        ddb=DDB(dbname)
+        ddb.computedups(basedir)
+    elif opmode=='GETINCLUDED':
+        ddb=DDB(dbname)
+        ddb.getincluded(basedir)
     else:
         usage()
