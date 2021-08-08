@@ -241,13 +241,6 @@ class DDB():
 
         #print((bdir,processed,init_path,parentdir,self.mytime))
         dir,dir_printable = mydecode_path(bdir)
-        refdb = hasattr(self,'cur_ref')
-        if refdb:
-            #alreadythere = self.cur_ref.execute("select * from files where path=? and size=?", (path_in_db,entrysize)).fetchall() if refdb and entrysize>1<<10 else []
-            refdb_alreadythere = {"files":{},"dirs":{},"symlinks":{}}
-            for table in refdb_alreadythere.keys():
-                for k in self.cur_ref.execute(f"select * from {table} where parentdir=?", (dir_printable,)):
-                    refdb_alreadythere[table][k[3]]=k
         if init_path==None:
             init_path=dir.rstrip('/')
             print("\n==== Starting scan ====\n")
@@ -256,6 +249,18 @@ class DDB():
             parentdir_in_db = '/'
         else:
             parentdir_in_db = dbpath(parentdir)
+
+        refdb = hasattr(self,'cur_ref')
+        if refdb:
+            refdb_alreadythere={}
+            #alreadythere = self.cur_ref.execute("select * from files where path=? and size=?", (path_in_db,entrysize)).fetchall() if refdb and entrysize>1<<10 else []
+            #refdb_alreadythere = {"files":{},"dirs":{},"symlinks":{}}
+            #for table in refdb_alreadythere.keys():
+            for k in self.cur_ref.execute(f"select * from files where parentdir=?", (dbpath(dir_printable),)):
+                refdb_alreadythere[k[3]]=k
+                #print(k[3])
+                if "vim82" in dir_printable:
+                    print("_________________ " + str(k))
 
         dirsize=0 # size of current dir including subdirs
         dircontents = array.array('q') # Array of hashes for the contents of current dir. array('q') is more space-efficient than linked list, and better than numpy in this phase as it can easily grow without destroying/recreating the array
@@ -267,6 +272,7 @@ class DDB():
             path_in_db = dbpath(path_printable)
             if not os.path.exists(path) or not os.access(path, os.R_OK):
                 continue
+
             if entry.is_dir(follow_symlinks=False):
                 entrysize,dxxh = self.dirscan(entry.path,init_path=init_path,parentdir=dir_printable,dirstat=entry.stat(follow_symlinks=False),dirlevel=dirlevel+1)
                 # Insertion in DB is below at dir toplevel (and this is a recursive call)
@@ -284,8 +290,8 @@ class DDB():
                 entrysize = int(filestat.st_size)
                 # Check whether the entry is already in refdb. If yes : reuse that entry (assuming the contents of the file didn't change). This enables to increase performance since a lot of time is spent in os.read() for xxhash() especially on spinning disks...
                 #alreadythere = self.cur_ref.execute("select * from files where path=? and size=?", (path_in_db,entrysize)).fetchall() if refdb and entrysize>1<<10 else []
-                if path_printable in refdb_alreadythere["files"]:
-                    res = refdb_alreadythere["files"][path_printable]
+                if refdb and path_in_db in refdb_alreadythere:
+                    res = refdb_alreadythere[path_in_db]
                     fxxh = res[5]
                     #print('__debug__: file ' + path + ' already in DB !' + name)
                 else:
@@ -299,7 +305,9 @@ class DDB():
                 self.processedsize+=entrysize
                 dir_numfiles += 1
             else:
-                print("__error__: " + path)
+                continue # e.g. named pipes...
+                #print("__error__: " + path)
+                #entrysize=0
             dirsize += entrysize
             printprogress()
         npdircontents = np.array(dircontents, dtype=np.int64)
@@ -897,11 +905,12 @@ if __name__ == "__main__":
         try:
             ddb.dirscan(basedir)
         except(KeyboardInterrupt):
-            ddb.conn.commit()
+            ddb.sync_db()
+            #ddb.conn.commit()
             allsize = ddb.dbgsize()
             print("\n_________________\nkeyboard interrupt, %d processed, %d stored" % (globalsize>>20, allsize>>20))
             ddb.conn.close()
-        ddb.conn.commit()
+        ddb.sync_db()
         ddb.conn.close()
 
     elif opmode=='SCAN_LEGACY':
