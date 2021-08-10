@@ -81,21 +81,41 @@ def mydecode_path(pathbytes,fixparts=False):
 # DB class
 
 class DDB():
-    def __init__(self, dbname, refdb=None, domagic=False):
+    def __init__(self, dbname, refdb=None, domagic=False, resumedb=False):
+        self.dbname=dbname
         self.conn = sqlite3.connect(dbname)
-        if refdb!=None:
-            self.connref = sqlite3.connect(refdb)
-            self.cur_ref = self.connref.cursor()
-            print("Using refdb " + refdb)
+        self.cur = self.conn.cursor()
+        self.processedfiles = 0
+        self.processedsize = 0
+        if resumedb:
+            print('Looking for resume')
+            tables = [k[0] for k in self.cur.execute("select name from sqlite_master where type='table'").fetchall()]
+            if 'files' in tables and 'dirs' in tables:
+                #emptyf = self.cur.execute("select count(*),sum(size) from files").fetchall()
+                #emptyf = self.cur.execute("select id from files limit 2").fetchall()
+                mydirs = self.cur.execute("select path,size,xxh64be,nsubfiles from dirs").fetchall()
+                if len(mydirs)>0:
+                    print("Resuming from previous scan")
+                    #self.processedfiles=emptyf[0][0]
+                    #self.processedsize=emptyf[0][1]
+                    self.dbcache_dirs = {k[0]:[k[1],k[2],k[3]] for k in mydirs}
+                    #self.cur_ref = self.conn.cursor()
+                    self.cur.execute("delete from files where not parentdir in (select path from dirs)")
+                else:
+                    print('No existing entries')
+            else:
+                print('No existing tables')
+                self.createdb()
+        #elif refdb!=None:
+            #self.connref = sqlite3.connect(refdb)
+            #self.cur_ref = self.connref.cursor()
+            #print("Using refdb " + refdb)
         #self.init_path=init_path.rstrip('/')
         self.magictypes = {}
         self.domagic=domagic
-        self.cur = self.conn.cursor()
         self.param_id = 0
         self.timer_print=time.time()
         self.timer_insert=time.time()
-        self.processedfiles = 0
-        self.processedsize = 0
         self.dbcache={"dirs":[], "files":[], "symlinks": []}
         if self.domagic==True:
             for line in self.cur.execute('select id,magictype from magictypes'):
@@ -103,6 +123,7 @@ class DDB():
                 self.magictypes[magictype] = magicid
 
     def createdb(self):
+        print("Creating / resetting DB")
         cur = self.conn.cursor()
         # Create the DB. Notice that 'path' is duplicate information for 'parentdir/name' which may seem suboptimal, yet it is useful to have both for performance in various situations when using indexes (e.g. indexed full path is useful for FUSE)
         cur.executescript('''
@@ -234,8 +255,8 @@ class DDB():
                 k=dbpath(dir_printable)
                 ld=len(k) - (os.get_terminal_size()[0]-40)
                 if ld>0:
-                    k="..."+k[ld:]
-                sys.stderr.write("\033[2K\rScanning: [%d MB, %d files] %s" % (self.processedsize>>20, self.processedfiles, dir_printable.replace(init_path, '')))
+                    k=colored("...",'red')+k[ld:]
+                sys.stderr.write(f"\033[2K\rScanning: [{self.processedsize>>20} MB, {self.processedfiles} files] {k}")
                 sys.stderr.flush()
                 self.timer_print=mytime2
 
@@ -244,23 +265,35 @@ class DDB():
         if init_path==None:
             init_path=dir.rstrip('/')
             print("\n==== Starting scan ====\n")
-            self.cur.execute('insert or replace into dbsessions values (null, ?,?)', (int(self.timer_print), init_path))
+            #self.cur.execute('insert or replace into dbsessions values (null, ?,?)', (int(self.timer_print), init_path))
             self.param_id=self.cur.lastrowid
             parentdir_in_db = '/'
         else:
             parentdir_in_db = dbpath(parentdir)
 
-        refdb = hasattr(self,'cur_ref')
+        if hasattr(self,'dbcache_dirs'): # Resume / speedup scan
+            mypath=dbpath(dir_printable)
+            if mypath in self.dbcache_dirs:
+                mysize,myxxh,mysubfiles = self.dbcache_dirs[mypath]
+                self.processedfiles+=mysubfiles
+                self.processedsize+=mysize
+                return mysize,myxxh
+
+        refdb=False # FIXME: still useful to resume from different file ?? (sqlite performance seems bottleneck anyway in that case...)
         if refdb:
             refdb_alreadythere={}
             #alreadythere = self.cur_ref.execute("select * from files where path=? and size=?", (path_in_db,entrysize)).fetchall() if refdb and entrysize>1<<10 else []
             #refdb_alreadythere = {"files":{},"dirs":{},"symlinks":{}}
             #for table in refdb_alreadythere.keys():
-            for k in self.cur_ref.execute(f"select * from files where parentdir=?", (dbpath(dir_printable),)):
+            for k in self.cur_ref.execute("select * from files where parentdir=?", (dbpath(dir_printable),)):
                 refdb_alreadythere[k[3]]=k
                 #print(k[3])
-                if "vim82" in dir_printable:
-                    print("_________________ " + str(k))
+            #k=self.cur_ref.execute("select size,xxh64be,nsubfiles from dirs where path=?", (dbpath(dir_printable),)).fetchall()
+            #if k:
+                #dirsize,dxxh,nsubfiles=k[0][0],k[0][1],k[0][2]
+                #self.processedfiles+=nsubfiles
+                #self.processedsize+=dirsize
+                #return dirsize,dxxh
 
         dirsize=0 # size of current dir including subdirs
         dircontents = array.array('q') # Array of hashes for the contents of current dir. array('q') is more space-efficient than linked list, and better than numpy in this phase as it can easily grow without destroying/recreating the array
@@ -291,6 +324,9 @@ class DDB():
                 # Check whether the entry is already in refdb. If yes : reuse that entry (assuming the contents of the file didn't change). This enables to increase performance since a lot of time is spent in os.read() for xxhash() especially on spinning disks...
                 #alreadythere = self.cur_ref.execute("select * from files where path=? and size=?", (path_in_db,entrysize)).fetchall() if refdb and entrysize>1<<10 else []
                 if refdb and path_in_db in refdb_alreadythere:
+                    if dbresume:
+                        print(path_in_db)
+                        continue
                     res = refdb_alreadythere[path_in_db]
                     fxxh = res[5]
                     #print('__debug__: file ' + path + ' already in DB !' + name)
@@ -316,7 +352,7 @@ class DDB():
         #bisect.insort(dircontents[os.path.dirname(dir)], dirxxh)
         if dirstat==None:
             dirstat = os.lstat(dir)
-        resdir = ( None, parentdir_in_db, dir_printable, parentdir_in_db+'/'+dir_printable, dirsize, dir_numfiles, dir_numdirs, dxxh, int(dirstat.st_mtime), dirstat.st_mode, dirstat.st_uid, dirstat.st_gid, dirstat.st_nlink, dirstat.st_dev, self.param_id )
+        resdir = ( None, parentdir_in_db, os.path.basename(dir_printable), dbpath(dir_printable), dirsize, dir_numfiles, dir_numdirs, dxxh, int(dirstat.st_mtime), dirstat.st_mode, dirstat.st_uid, dirstat.st_gid, dirstat.st_nlink, dirstat.st_dev, self.param_id )
         self.insert_db(resdir,"dirs")
         return dirsize,dxxh
 
@@ -665,7 +701,6 @@ class DDB():
 
     def isincluded(self, path_test, path_ref, otherddbfs=None, excluded="",docount=True,displaytrue=False,basedir="/mnt/raid", checkfs=True): #basedir="/mnt/raid"
         """Checks whether every file under path_test/ (and subdirs) has a copy somewhere in path_ref (regardless of the directory structure in path_ref/ )"""
-        print(f"Test whether {path_test} is included in {path_ref}")
         cur = self.conn.cursor()
         if otherddbfs:
             conn2 = sqlite3.connect(otherddbfs)
@@ -685,16 +720,21 @@ class DDB():
                 continue
             if not otherddbfs and path_ref=='':
                 rs2=cur2.execute("select path from files where xxh64be=? and size=? and not path like ?", (xxh, size, path_test+'/%')).fetchall()
+            elif otherddbfs:
+                #rs2=cur2.execute("select path from files where xxh64be=? and size=? and path like ?", (xxh, size, path_ref+'/%')).fetchall()
+                rs2=cur2.execute("select path from files where xxh64be=? and size=? and path like ? limit 1", (xxh, size, path_ref+'/%')).fetchall()
             else:
-                rs2=cur2.execute("select path from files where xxh64be=? and size=? and path like ?", (xxh, size, path_ref+'/%')).fetchall()
+                rs2=cur2.execute("select path from files where xxh64be=? and size=? and path!=? and path like ?", (xxh, size, path, path_ref+'/%')).fetchall()
+                #rs2=cur2.execute("select path from files where xxh64be=? and size=? and path!=?", (xxh, size, path)).fetchall()
             if not rs2 and (checkfs==False or os.path.exists(basedir+path)):
-                print(colored(f"\033[2K\rNo equivalent for ({size>>20} Mo) : {path}",'yellow'))
-                res.append(path)
-            elif basedir!='':
+                print(colored(f"\033[2K\r  {xxh+(1<<63):0>16x}, {size>>20} Mo : {self.dbname}:{path}",'yellow'))
+                #res.append(path)
+            elif basedir!='': # FIXME: else ?
                 # Let's check on the filesystem in case the duplicates would have been deleted compared to what's in the DB
                 l=0
                 if checkfs==True and len(rs2)<=20: # FIXME: "len(rs2)>20 or" is there because of performance issues with some results that have a large number of duplicates (e.g. small system/compilation files that are identical among many projects). But this workaround is suboptimal.
                     for dup in rs2:
+                        #print((path,rs2[0]))
                         if not 'lost+found' in dup[0] and os.path.exists(basedir+dup[0]):
                             l+=1
                             break
@@ -705,7 +745,11 @@ class DDB():
                 if l==0:
                     print(colored(f"\033[2K\rNo equivalent anymore for ({size>>20} Mo) : {path}",'red'))
                     res.append(path)
-            sys.stderr.write(f"\033[2K\rScanning: [{k} / {mycount} entries] ") ; sys.stderr.flush()
+            mytime2=time.time()
+            if mytime2-self.timer_print>0.05:
+                sys.stderr.write(f"\033[2K\rScanning: [{k} / {mycount} entries, {int(100*k/mycount)}%] ")
+                sys.stderr.flush()
+                self.timer_print=mytime2
             k+=1
         if otherddbfs:
             conn2.close()
@@ -897,21 +941,19 @@ if __name__ == "__main__":
             #statvfs_used = (statvfs.f_frsize*(statvfs.f_blocks-statvfs.f_bfree))>>20
             #cur = self.conn.cursor()
             #self.processedsize = cur.execute("select sum(files.size) from files").fetchall()[0][0]
-            print ('reset DB')
             ddb.createdb()
             ddb.conn.commit()
         #scansubdir=sys.argv[4] if len(sys.argv)==5 else ''
-        ddb.conn.execute('BEGIN')
+        #ddb.conn.execute('BEGIN')
         try:
-            ddb.dirscan(basedir)
+            ddb.dirscan(basedir, resumedb=True)
+            ddb.sync_db()
+            ddb.conn.close()
         except(KeyboardInterrupt):
             ddb.sync_db()
-            #ddb.conn.commit()
             allsize = ddb.dbgsize()
             print("\n_________________\nkeyboard interrupt, %d processed, %d stored" % (globalsize>>20, allsize>>20))
             ddb.conn.close()
-        ddb.sync_db()
-        ddb.conn.close()
 
     elif opmode=='SCAN_LEGACY':
         print((dbname,basedir, len(sys.argv)))
@@ -935,5 +977,14 @@ if __name__ == "__main__":
     elif opmode=='GETINCLUDED':
         ddb=DDB(dbname)
         ddb.getincluded(basedir)
+    elif opmode=='COMPAREDB':
+        # FIXME: change "basedir" to better variable name
+        ddb=DDB(dbname)
+        print(f"Files from {dbname} that are not in {basedir} (deleted files)")
+        ddb.isincluded('','',otherddbfs=basedir,basedir='',checkfs=False)
+        #ddb=DDB(basedir)
+        #print(f"\n_________\nFiles from {basedir} that are not in {dbname}  (new files)")
+        #ddb.isincluded('','',otherddbfs=dbname,basedir='',checkfs=False)
     else:
         usage()
+    print()
