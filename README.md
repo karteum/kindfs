@@ -10,6 +10,7 @@ Indexing should properly support (and not fail) when a part of the filesystem us
 This program is in early phase and still not finished. Expect bugs ! The DB schema is simple but not optimal (and certainly not 3NF), and some informations are duplicate (e.g. 'parentdir/name' is equivalent to 'path', but all 3 fields were convenient for performance with sqlite indexes and FUSE)
 
 ## Usage
+UI is work-in-progress and will be re-worked in the future. For the moment
 * `kindfs RESETDB <dbfile> <path>` : creates the sqlite file dbfile and scans the filesystem under path/
   * For performance, it is strongly adviced to have the DB on an SSD or in RAM, noting that DB can have a size around 1/1000th of the scanned data in typical cases: e.g. mine is 6 GB big after indexing my 6 TB NAS, but your mileage may vary e.g. if you have only few very big files...
   * `kindfs SCAN <dbfile> <path>` : does the same but does not reset the DB and enables to resume scanning if it was aborted for any reason (useful for very large filesystems where scanning takes hours)
@@ -20,7 +21,7 @@ This program is in early phase and still not finished. Expect bugs ! The DB sche
 * `kindfs ISINCLUDED <dbfile> <dir1> <dir2>` : checks whether all files from dir1 are present in dir2 (regardless of files/dirs structure), and otherwise displays all entries from dir1 (and subdirs, regardless of structure) that could not be found in dir2
 * `kindfs DIFF <dbfile> <dir1> <dir2>` : equivalent to `kindfs ISINCLUDED <dbfile> <dir1> <dir2>` + `kindfs ISINCLUDED <dbfile> <dir2> <dir1>` i.e. will display all files from one side that are not on the other side
 * `kindfs COMPAREDB <dbfile1> <dbfile2>` : will display all entries from one DB that are not on the other DB (i.e. compares two versions of a DB, assuming that the path prefix is identical)
-* `kindfs DUPS <dbfile> <dir>` : returns the biggest duplicate dirs/files in the DB. Dir may be empty with `''`.
+* `kindfs DUPDIRS <dbfile> <dir>` (resp `DUPFILES` instead of `DUPDIRS`): returns the biggest duplicate dirs/files in the DB. Dir may be empty with `''`.
   * N.B. If the original FS is mounted (e.g. from a NAS), it checks whether those duplicates are still there.
 * (more to come once it is better tested...)
 

@@ -4,11 +4,15 @@
 # Version: 20210411
 # License: GPLv3
 # Prerequisite : pip install xxhash numpy fusepy python-magic
-# Beware : this software only hashes portions of files for speed (and therefore may consider that some files/dirs are identical when they are not really). Use this program at your own risk and only when you know what you are doing !
+# Beware : this software only hashes portions of files for speed (and therefore may consider that some files/dirs are identical when they are not really). Use this program at your own risk and only when you know what you are doing ! (and double-check with filenames + if unsure, triple-check with full md5sum or diff -r !)
 
-# sqlite3 ../Duplicide/knas_20210616.db "select path from files where name='.picasa.ini';" | while read line; do a="/mnt/raid$line"; rm "$a" ; echo "$a"; done
+
+# Parameters
+DB_COMMIT_PERIODICITY=0.1  # flush/commit DB every x seconds. Higher values implies more RAM usage but higher I/O performance
+FILE_HASH_CHUNKSIZE=1<<20  # default is to hash 1MB data at begin/middle/end of files i.e. 3MB total. Smaller values means faster scan but more risk to miss differences in files
 
 import sqlite3,xxhash
+#from crc32c import crc32
 import fnmatch
 import math
 import os, errno, sys, stat
@@ -38,7 +42,7 @@ def logme(f):
         return f(*args, **kwargs)
     return wrapped
 
-def xxhash_file(filename, filesize=None, chunksize=1<<20, inclsize=False, inclname=False):
+def xxhash_file(filename, filesize=None, chunksize=FILE_HASH_CHUNKSIZE, inclsize=False, inclname=False):
     """Return pseudo-hash of a file using xxhash64 on 3 MBytes of that file at its beginning/middle/end. Optionally include the size and filename into the pseudo-hash"""
     if filesize==None:
         filesize=int(os.stat(filename).st_size)
@@ -81,7 +85,7 @@ def mydecode_path(pathbytes,fixparts=False):
 # DB class
 
 class DDB():
-    def __init__(self, dbname, refdb=None, domagic=False, resumedb=False):
+    def __init__(self, dbname, domagic=False, resumedb=False):
         self.dbname=dbname
         self.conn = sqlite3.connect(dbname)
         self.cur = self.conn.cursor()
@@ -116,7 +120,7 @@ class DDB():
         self.param_id = 0
         self.timer_print=time.time()
         self.timer_insert=time.time()
-        self.dbcache={"dirs":[], "files":[], "symlinks": []}
+        self.dbcache_insert={"dirs":[], "files":[], "symlinks": []}
         if self.domagic==True:
             for line in self.cur.execute('select id,magictype from magictypes'):
                 magicid,magictype = line
@@ -138,7 +142,7 @@ class DDB():
                 id integer primary key autoincrement,
                 parentdir text,
                 name text,
-                path text,
+                path text UNIQUE,
                 size integer,
                 xxh64be integer,
                 st_mtime integer, st_mode integer, st_uid integer, st_gid integer, st_ino integer, st_nlink integer, st_dev integer,
@@ -157,7 +161,7 @@ class DDB():
                 id integer primary key autoincrement,
                 parentdir text,
                 name text,
-                path text,
+                path text UNIQUE,
                 size integer,
                 nsubfiles integer,
                 nsubdirs integer,
@@ -229,7 +233,7 @@ class DDB():
             if len(vec)>0 and (isinstance(vec[0],tuple) or isinstance(vec[0],list)):
                 self.cur.executemany(f'insert or replace into {table} values ({",".join("?" for k in vec[0])})', vec)
                 vec.clear()
-        for k,v in self.dbcache.items():
+        for k,v in self.dbcache_insert.items():
             #print((k,v))
             sync_one(k,v)
         self.conn.commit()
@@ -237,9 +241,9 @@ class DDB():
     def insert_db(self,vec,table, sync=False):
         if len(vec)==0:
             return
-        self.dbcache[table].append(vec)
+        self.dbcache_insert[table].append(vec)
         mytime2=time.time()
-        if sync or mytime2-self.timer_insert>0.1:
+        if sync or mytime2-self.timer_insert>DB_COMMIT_PERIODICITY:
             self.sync_db()
             self.timer_insert=mytime2
             #self.cur.execute(f'insert or replace into {table} values ({",".join("?" for k in vec)})', vec) #q = '(' + '?,' * (len(vec)-1) + '?)'
@@ -251,7 +255,7 @@ class DDB():
             return path.replace(init_path, '')
         def printprogress():
             mytime2=time.time()
-            if mytime2-self.timer_print>0.1:
+            if mytime2-self.timer_print>DB_COMMIT_PERIODICITY:
                 k=dbpath(dir_printable)
                 ld=len(k) - (os.get_terminal_size()[0]-40)
                 if ld>0:
@@ -265,7 +269,7 @@ class DDB():
         if init_path==None:
             init_path=dir.rstrip('/')
             print("\n==== Starting scan ====\n")
-            #self.cur.execute('insert or replace into dbsessions values (null, ?,?)', (int(self.timer_print), init_path))
+            self.cur.execute('insert or replace into dbsessions values (null, ?,?)', (int(self.timer_print), init_path))
             self.param_id=self.cur.lastrowid
             parentdir_in_db = '/'
         else:
@@ -278,22 +282,8 @@ class DDB():
                 self.processedfiles+=mysubfiles
                 self.processedsize+=mysize
                 return mysize,myxxh
-
-        refdb=False # FIXME: still useful to resume from different file ?? (sqlite performance seems bottleneck anyway in that case...)
-        if refdb:
-            refdb_alreadythere={}
-            #alreadythere = self.cur_ref.execute("select * from files where path=? and size=?", (path_in_db,entrysize)).fetchall() if refdb and entrysize>1<<10 else []
-            #refdb_alreadythere = {"files":{},"dirs":{},"symlinks":{}}
-            #for table in refdb_alreadythere.keys():
-            for k in self.cur_ref.execute("select * from files where parentdir=?", (dbpath(dir_printable),)):
-                refdb_alreadythere[k[3]]=k
-                #print(k[3])
-            #k=self.cur_ref.execute("select size,xxh64be,nsubfiles from dirs where path=?", (dbpath(dir_printable),)).fetchall()
-            #if k:
-                #dirsize,dxxh,nsubfiles=k[0][0],k[0][1],k[0][2]
-                #self.processedfiles+=nsubfiles
-                #self.processedsize+=dirsize
-                #return dirsize,dxxh
+            #else: # FIXME: seems counter productive (sqlite bottleneck ?)
+            #    refdb_alreadythere={k[0]:k[1] for k in self.cur_ref.execute("select path,size from files where parentdir=?", (dbpath(dir_printable),)).fetchall() }
 
         dirsize=0 # size of current dir including subdirs
         dircontents = array.array('q') # Array of hashes for the contents of current dir. array('q') is more space-efficient than linked list, and better than numpy in this phase as it can easily grow without destroying/recreating the array
@@ -305,7 +295,6 @@ class DDB():
             path_in_db = dbpath(path_printable)
             if not os.path.exists(path) or not os.access(path, os.R_OK):
                 continue
-
             if entry.is_dir(follow_symlinks=False):
                 entrysize,dxxh = self.dirscan(entry.path,init_path=init_path,parentdir=dir_printable,dirstat=entry.stat(follow_symlinks=False),dirlevel=dirlevel+1)
                 # Insertion in DB is below at dir toplevel (and this is a recursive call)
@@ -321,20 +310,9 @@ class DDB():
             elif entry.is_file(follow_symlinks=False): # regular file. FIXME: sort by inode (like in https://github.com/pixelb/fslint/blob/master/fslint/findup) in order to speed up scanning ?
                 filestat = entry.stat(follow_symlinks=False)
                 entrysize = int(filestat.st_size)
-                # Check whether the entry is already in refdb. If yes : reuse that entry (assuming the contents of the file didn't change). This enables to increase performance since a lot of time is spent in os.read() for xxhash() especially on spinning disks...
-                #alreadythere = self.cur_ref.execute("select * from files where path=? and size=?", (path_in_db,entrysize)).fetchall() if refdb and entrysize>1<<10 else []
-                if refdb and path_in_db in refdb_alreadythere:
-                    if dbresume:
-                        print(path_in_db)
-                        continue
-                    res = refdb_alreadythere[path_in_db]
-                    fxxh = res[5]
-                    #print('__debug__: file ' + path + ' already in DB !' + name)
-                else:
-                    #print('__debug__: file ' + path + ' not in DB !')
-                    fxxh = xxhash_file(path, entrysize)
-                    mymagicid=self.magicid(path)
-                    res = ( None, os.path.dirname(path_in_db), name_printable, path_in_db, entrysize, fxxh, int(filestat.st_mtime), filestat.st_mode, filestat.st_uid, filestat.st_gid, filestat.st_ino, filestat.st_nlink, filestat.st_dev, self.param_id, mymagicid )
+                fxxh = xxhash_file(path, entrysize)
+                mymagicid=self.magicid(path)
+                res = ( None, os.path.dirname(path_in_db), name_printable, path_in_db, entrysize, fxxh, int(filestat.st_mtime), filestat.st_mode, filestat.st_uid, filestat.st_gid, filestat.st_ino, filestat.st_nlink, filestat.st_dev, self.param_id, mymagicid )
                 self.insert_db(res,"files")
                 dircontents.append(fxxh) #bisect.insort(dircontents[dir], xxh)
                 self.processedfiles+=1
@@ -356,173 +334,35 @@ class DDB():
         self.insert_db(resdir,"dirs")
         return dirsize,dxxh
 
-    def scandir_legacy(self, init_path):
-        statvfs=os.statvfs(init_path)
-        #statvfs_total = (statvfs.f_frsize*statvfs.f_blocks)>>20
-        #statvfs_avail = (statvfs.f_frsize*(statvfs.f_bfree))>>20
-        statvfs_used = (statvfs.f_frsize*(statvfs.f_blocks-statvfs.f_bfree))>>20
-
-        #progress = progresswalk(init_path)
-        init_path=init_path.rstrip('/')
-        processedfiles=0
-        option_excludelist=[]
-        dirsizes = defaultdict(int)
-        dirxxh = defaultdict(int)
-        global globalsize
-        aflag=False
+    def walkupdate(self, init_path="/mnt/raid"): # FIXME: won't update files that changed (without deletion)
+        def fspath(dbpath):
+            return init_path+'/'+dbpath
+        if not os.path.exists(init_path) or not os.access(init_path, os.R_OK):
+            return
         cur = self.conn.cursor()
-        #cur2 = self.conn.cursor()
-        # Read dircontents
-        print("\n==== Reading DB ====\n")
-        #allsize = cur.execute("select sum(files.size) from files inner join dirs on files.parentdir=(dirs.parentdir||'/'||dirs.name)").fetchall()[0][0]
-        processedsize = cur.execute("select sum(files.size) from files").fetchall()[0][0]
-        #if allsize != None:
-        #    processedsize += allsize
-        if processedsize==None:
-            processedsize=0
-
-        for k in cur.execute("select parentdir,name,xxh64be,size from dirs where xxh64be is not null"):
-            parentdir,name,xxh,dirsize = k
-            curdir=parentdir+'/'+name
-            dirxxh[curdir]=xxh
-            dirsizes[curdir]=dirsize
-            #if nsubdirs==0:
-            #    processedsize += dirsize # FIXME: does't work if some dir has subdirs+inner files
-            #     allsize4 = cur2.execute("select sum(size) from files where parentdir=?", [curdir]).fetchall()[0][0]
-            #     if(dirsize != allsize4 and dirsize!=0):
-            #         print("___ " + str((curdir,allsize4,dirsize)))
-
-        if self.domagic==True:
-            for line in cur.execute('select id,magictype from magictypes'):
-                magicid,magictype = line
-                self.magictypes[magictype] = magicid
-
-        print("\n==== Starting scan ====\n(already %d in DB)" % (processedsize>>20))
-        mytime1=time.time()
-        cur.execute('insert or replace into dbsessions values (null, ?,?)', (int(mytime1), init_path))
-        param_id=cur.lastrowid
-        for (_dir, dirs, files) in os.walk(bytes(init_path, encoding='utf-8'), topdown=False):
-            dir,dir_printable = mydecode_path(_dir)
-            #print("==> entering " + dir)
-            #time.sleep(0.2)
-            if dir in dirsizes: # and dir in dirxxh
-                #processedsize += dirsizes[dir]
-                #print (dir + "already in DB -> skipping")
+        cur2 = self.conn.cursor()
+        for dir,dir,files in self.walk():
+            fsdir = fspath(dir)
+            if not os.path.exists(fsdir) or not os.access(fsdir, os.R_OK) or not os.path.isdir(fsdir):
+                print(f"Deleting {dir} from DB")
+                cur.execute("delete from dirs where path like ?", (dir+'/%',))
+                cur.execute("delete from files where path like ?", (dir+'/%',))
+                cur.execute("delete from symlinks where path like ?", (dir+'/%',))
                 continue
-            #else:
-                #dirsizes[dir] = cur2.execute("select sum(size) from files where parentdir=?", [dir]).fetchall()[0][0]
-
-            #progress.update(dir, dirs, files)
-            for excludetest in option_excludelist:
-                if fnmatch.fnmatch(dir, excludetest):
-                    continue
-
-            # Processing current dir
-            dircontents = array.array('q') # Sorted array of hashes for the contents of current dir. array('q') is more space-efficient than linked list, and better than numpy in this phase as it can easily grow without destroying/recreating the array
-            dirsize=0 # size of current dir including subdirs
-            res=[] # dir contents to insert (all at once for performance) in the DB
-            for _file in files:
-                file,file_printable = mydecode_path(_file)
-                #if file=='.DS_Store' or file=='._.DS_Store':
-                #    continue
-                path = dir + "/" + file
-                path_printable = dir_printable + "/" + file_printable
-                alreadythere = cur.execute("select size from files where path=?", (path_printable.replace(init_path, ''),)).fetchall()
-                if len(alreadythere)>0:
-                    print('Error: file ' + path + ' already in DB !' + str(alreadythere[0]))
-                    # FIXME: add size to dirsize and xxh to dircontents ?
-                    continue
-                if not os.path.exists(path) or not os.access(path, os.R_OK) or not os.path.isfile(path):
-                    # Skip broken symlinks, and cases where we do not have access rights. TODO: check whether access rights are tied to inode or path
-                    #sys.stderr.write("Unable to access %s!\n" % (path,))
-                    continue
-                if os.path.islink(path):
-                    ltarget = os.readlink(path)
-                    lxxh = xxhash.xxh64(file + ' -> ' + ltarget).intdigest() - (1<<63)
-                    dircontents.append(lxxh)
-                    cur.execute('insert or replace into symlinks values (null,?,?,?,?,?,?,?)', (dir_printable.replace(init_path, ''), file_printable, path_printable.replace(init_path, ''), ltarget, 0, lxxh, param_id))
-                    continue
-                filestat = os.lstat(path)
-                filesize = int(filestat.st_size)
-                processedsize+=filesize
-                globalsize=processedsize
-                processedfiles+=1
-                dirsize += filesize
-                xxh = xxhash_file(path, filesize)
-                mymagicid=self.magicid(path)
-                #bisect.insort(dircontents[dir], xxh)
-                dircontents.append(xxh)
-                res.append(( None, dir_printable.replace(init_path, ''), file_printable, path_printable.replace(init_path, ''), filesize, xxh,
-                    int(filestat.st_mtime), filestat.st_mode, filestat.st_uid, filestat.st_gid, filestat.st_ino, filestat.st_nlink, filestat.st_dev, param_id, mymagicid
-                ))
-                #reslen= '(' + '?,' * (len(res)-1) + '?)'
-                #cur.execute('insert or replace into files values ' + reslen, res)
-
-                #sys.stderr.write("\033[2K\r%s\rScanning: [%d %%, %d MB, %d files] %s" % (" " * 500, 100*processedsize/totalsize/1024, processedsize>>20, processedfiles, path))
-                #progress.updatef()
-                mytime2=time.time()
-                if (int(mytime2)%10)==0:
-                    if aflag==True:
-                        self.conn.commit()
-                    aflag=False
-                else:
-                    aflag=True
-
-                if mytime2-mytime1>0.2:
-                    sys.stderr.write("\033[2K\rScanning: [%d MB, %d files] %s" % (processedsize>>20, processedfiles, dir_printable.replace(init_path, '')))
-                    sys.stderr.flush()
-                    #conn.commit()
-                    mytime1=mytime2
-
-            for _mydir in dirs:
-                mydir,mydir_printable = mydecode_path(_mydir)
-                mypath=dir+'/'+mydir
-                mypath_printable=dir_printable+'/'+mydir_printable
-                if os.path.islink(mypath):
-                    ltarget = os.readlink(mypath)
-                    lxxh = xxhash.xxh64(mydir + ' -> ' + ltarget).intdigest() - (1<<63)
-                    dircontents.append(lxxh)
-                    cur.execute('insert or replace into symlinks values (null,?,?,?,?,?,?,?)', (dir_printable.replace(init_path, ''), mydir_printable, mypath_printable.replace(init_path, ''), ltarget, 1, lxxh, param_id))
-                elif mypath in dirxxh and mypath in dirsizes:
-                    dircontents.append(dirxxh[mypath])
-                    dirsize += dirsizes[mypath]
-                else: #if we do bottom-up, all subdirs are processed before the current dir so this should never happen
-                    print("Problem : " + mypath_printable + " not precomputed")
-                    # FIXME: handle access rights
-                    #rs = cur.execute("select xxh64be,size from dirs where parentdir='%s' and name in %s" % (dir, "('"+"','".join(dirs)+"')"))
-                    #rs = cur.execute("select xxh64be,size from dirs where parentdir=? and name=?", (dir, mydir))
-                    #for k in rs:
-                    #    dircontents.append(k[0])
-                    #    dirsize += k[1]
-
-            # Compute "directory hash"
-            npdircontents = np.array(dircontents, dtype=np.int64)
-            npdircontents.sort()
-            dxxh = xxhash.xxh64(npdircontents.tobytes()).intdigest() - (1<<63)
-            dirxxh[dir] = dxxh
-            dirsizes[dir] = dirsize
-            #bisect.insort(dircontents[os.path.dirname(dir)], dirxxh)
-            dirstat = os.lstat(dir)
-            resdir = (
-                None, os.path.dirname(dir_printable).replace(init_path, ''), os.path.basename(dir_printable), dir_printable.replace(init_path, ''), dirsize, len(files), len(dirs), dxxh,
-                int(dirstat.st_mtime), dirstat.st_mode, dirstat.st_uid, dirstat.st_gid, dirstat.st_nlink, dirstat.st_dev, param_id
-            )
-            reslen2 =  '(' + '?,' * (len(resdir)-1) + '?)'
-            #conn.execute('BEGIN')
-            cur.execute('insert or replace into dirs values ' + reslen2, resdir)
-            if len(res)>0:
-                reslen= '(' + '?,' * (len(res[0])-1) + '?)'
-                cur.executemany('insert or replace into files values ' + reslen, res)
-            #     conn.rollback()
-            # else:
-            #     conn.commit()
-        print('\nDone')
+        for dir,dir,files in self.walk():
+            for file in files:
+                fsfile = fspath(file)
+                if not os.path.exists(fsfile) or not os.access(fsfile, os.R_OK): # or not os.path.isfile(fsfile):
+                    print(f"Deleting {file} from DB")
+                    cur.execute("delete from files where path like ?", (dir+'/%',))
+                    cur.execute("delete from symlinks where path like ?", (dir+'/%',))
 
     def computedups(self,basedir="/mnt/raid",dirsorfiles="dirs", wherepathlike='/%'):
         # select (dups-1)*size/1048576 as sz, * from dirdups where not parentdir in (select path from dirdups)
         cur = self.conn.cursor()
         cur2 = self.conn.cursor()
         print("Computing duplicates...")
+        print("___ " + basedir + " ___")
         cur.executescript(f'''
             create temp table tmp(parentdir text, path text, xxh64be integer, size integer, dups integer);
             insert into tmp select parentdir,path,xxh64be,size,foo.dups from {dirsorfiles} inner join (select count(*) as dups, xxh64be as xxh from {dirsorfiles} group by xxh64be having count(*)>1) foo on {dirsorfiles}.xxh64be=xxh where path like '{wherepathlike}';
@@ -558,13 +398,14 @@ class DDB():
             #else:
                 #print (colored(mystr, 'red'))
 
-    def walk(self,init_path):
+    def walk(self,init_path=''):
         cur = self.conn.cursor()
         cur2 = self.conn.cursor()
         for res in cur.execute('select path from dirs where path like ? order by path',(init_path+'/%',)):
             dir=res[0]
             dirs = [k[0] for k in cur2.execute('select name from dirs where parentdir=?',(dir,))]
             files = [k[0] for k in cur2.execute('select name from files where parentdir=?',(dir,))]
+            files.append([k[0] for k in cur2.execute('select name from symlinks where parentdir=?',(dir,))])
             yield dir,dirs,files
 
     def getincluded(self,basedir="/mnt/raid", init_path="/mnt/raid", wherepathlike='/%', resetdb=False):
@@ -699,7 +540,7 @@ class DDB():
         cur = self.conn.cursor()
         return cur.execute("select sum(size) from files").fetchall()[0][0]
 
-    def isincluded(self, path_test, path_ref, otherddbfs=None, excluded="",docount=True,displaytrue=False,basedir="/mnt/raid", checkfs=True): #basedir="/mnt/raid"
+    def isincluded(self, path_test, path_ref, otherddbfs=None, excluded="",docount=True,displaytrue=False,basedir="/mnt/raid/adrien/Musique", checkfs=True): #basedir="/mnt/raid"
         """Checks whether every file under path_test/ (and subdirs) has a copy somewhere in path_ref (regardless of the directory structure in path_ref/ )"""
         cur = self.conn.cursor()
         if otherddbfs:
@@ -932,8 +773,8 @@ if __name__ == "__main__":
     basedir=sys.argv[3]
     if opmode in ('SCAN', 'RESETDB'):
         print((dbname,basedir, len(sys.argv)))
-        refdb = sys.argv[4] if len(sys.argv)==5 else None
-        ddb=DDB(dbname, refdb=refdb)
+        #refdb = sys.argv[4] if len(sys.argv)==5 else None
+        ddb=DDB(dbname, resumedb=True)
         if opmode=='RESETDB':
             #statvfs=os.statvfs(init_path)
             #statvfs_total = (statvfs.f_frsize*statvfs.f_blocks)>>20
@@ -946,7 +787,7 @@ if __name__ == "__main__":
         #scansubdir=sys.argv[4] if len(sys.argv)==5 else ''
         #ddb.conn.execute('BEGIN')
         try:
-            ddb.dirscan(basedir, resumedb=True)
+            ddb.dirscan(basedir)
             ddb.sync_db()
             ddb.conn.close()
         except(KeyboardInterrupt):
@@ -955,13 +796,6 @@ if __name__ == "__main__":
             print("\n_________________\nkeyboard interrupt, %d processed, %d stored" % (globalsize>>20, allsize>>20))
             ddb.conn.close()
 
-    elif opmode=='SCAN_LEGACY':
-        print((dbname,basedir, len(sys.argv)))
-        ddb=DDB(dbname)
-        ddb.createdb()
-        ddb.scandir_legacy(basedir)
-        ddb.conn.commit()
-        ddb.conn.close()
     elif opmode=='DUMP':
         ddb=DDB(dbname)
         ddb.dumpdir(basedir)
@@ -971,9 +805,12 @@ if __name__ == "__main__":
         ddb.isincluded(basedir,sys.argv[4],db2)
     elif opmode=='FUSEFS':
         FUSE(DDBfs(dbname), basedir, nothreads=True, foreground=True)
-    elif opmode=='DUPS':
+    elif opmode=='DUPDIRS':
         ddb=DDB(dbname)
         ddb.computedups(basedir)
+    elif opmode=='DUPFILES':
+        ddb=DDB(dbname)
+        ddb.computedups(basedir, dirsorfiles='files')
     elif opmode=='GETINCLUDED':
         ddb=DDB(dbname)
         ddb.getincluded(basedir)
