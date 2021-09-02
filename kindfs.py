@@ -9,7 +9,7 @@
 
 # Parameters
 DB_COMMIT_PERIODICITY=0.1  # flush/commit DB every x seconds. Higher values implies more RAM usage but higher I/O performance
-FILE_HASH_CHUNKSIZE=1<<20  # default is to hash 1MB data at begin/middle/end of files i.e. 3MB total. Smaller values means faster scan but more risk to miss differences in files
+FILE_HASH_CHUNKSIZE=1<<20  # default is to hash 1MB data at begin/middle/end of files i.e. 3MB total. Smaller values means faster scan but more risk to miss differences in files. set "None" if you want to scan 100% of the contents of your files for more safety (at the expense of scanning speed)
 
 import sqlite3,xxhash
 #from crc32c import crc32
@@ -110,17 +110,13 @@ class DDB():
             else:
                 print('No existing tables')
                 self.createdb()
-        #elif refdb!=None:
-            #self.connref = sqlite3.connect(refdb)
-            #self.cur_ref = self.connref.cursor()
-            #print("Using refdb " + refdb)
         #self.init_path=init_path.rstrip('/')
         self.magictypes = {}
         self.domagic=domagic
         self.param_id = 0
         self.timer_print=time.time()
         self.timer_insert=time.time()
-        self.dbcache_insert={"dirs":[], "files":[], "symlinks": []}
+        self.dbcache_insert=[]
         if self.domagic==True:
             for line in self.cur.execute('select id,magictype from magictypes'):
                 magicid,magictype = line
@@ -131,50 +127,43 @@ class DDB():
         cur = self.conn.cursor()
         # Create the DB. Notice that 'path' is duplicate information for 'parentdir/name' which may seem suboptimal, yet it is useful to have both for performance in various situations when using indexes (e.g. indexed full path is useful for FUSE)
         cur.executescript('''
+            drop table if exists entries;
+            create table entries(
+                id integer primary key autoincrement,
+                type CHAR(1) NOT NULL,
+                path text UNIQUE NOT NULL,
+                parentdir_len integer,
+                parentdir text GENERATED ALWAYS AS (substr(path,0,parentdir_len+1)) VIRTUAL,
+                name text GENERATED ALWAYS AS (substr(path,parentdir_len+2)) VIRTUAL,
+                size integer,
+                hash integer,
+                magictype integer,
+                nsubdirs integer,
+                nsubfiles integer,
+                symtarget text,
+                st_mtime integer, st_mode integer, st_uid integer, st_gid integer, st_ino integer, st_nlink integer, st_dev integer,
+                dbsession integer not null
+            );
+            create index entries_type_idx on entries(type);
+            create index entries_parentdir_idx on entries(parentdir);
+            create index entries_name_idx on entries(name);
+            create index entries_path_idx on entries(path);
+            create index entries_size_idx on entries(size);
+            create index entries_hash_idx on entries(hash);
+
+            drop view if exists files;
+            create view files as select id,parentdir,name,path,size,hash as xxh64be,st_mtime, st_mode, st_uid, st_gid, st_ino, st_nlink, st_dev,dbsession,magictype from entries where type='F';
+            drop view if exists dirs;
+            create view dirs as select id,parentdir,name,path,size,nsubfiles,nsubdirs,hash as xxh64be,st_mtime, st_mode, st_uid, st_gid, st_nlink, st_dev,dbsession,magictype from entries where type='D';
+            drop view if exists symlinks;
+            create view symlinks as select id,parentdir,name,path,symtarget as target,NULL as type,hash as xxh64be,dbsession,magictype from entries where type='S';
+
             drop table if exists dbsessions;
             create table dbsessions(
                 id integer primary key autoincrement,
                 timestamp integer not null,
                 init_path text
             );
-            drop table if exists files;
-            create table files(
-                id integer primary key autoincrement,
-                parentdir text,
-                name text,
-                path text UNIQUE,
-                size integer,
-                xxh64be integer,
-                st_mtime integer, st_mode integer, st_uid integer, st_gid integer, st_ino integer, st_nlink integer, st_dev integer,
-                dbsession integer not null,
-                magictype integer,
-                UNIQUE(parentdir,name,dbsession)
-            );
-            create index files_parentdir_idx on files(parentdir);
-            create index files_name_idx on files(name);
-            create index files_path_idx on files(path);
-            create index files_size_idx on files(size);
-            create index files_xxh64be_idx on files(xxh64be);
-
-            drop table if exists dirs;
-            create table dirs(
-                id integer primary key autoincrement,
-                parentdir text,
-                name text,
-                path text UNIQUE,
-                size integer,
-                nsubfiles integer,
-                nsubdirs integer,
-                xxh64be integer,
-                st_mtime integer, st_mode integer, st_uid integer, st_gid integer, st_nlink integer, st_dev integer,
-                dbsession integer not null,
-                UNIQUE(parentdir,name,dbsession)
-            );
-            create index dirs_parentdir_idx on dirs(parentdir);
-            create index dirs_name_idx on dirs(name);
-            create index dirs_path_idx on dirs(path);
-            create index dirs_size_idx on dirs(size);
-            create index dirs_xxh64be_idx on dirs(xxh64be);
 
             drop table if exists magictypes;
             create table magictypes(
@@ -183,20 +172,6 @@ class DDB():
                 magictype text
             );
             create index magictypes_magictype_idx on magictypes(magictype);
-
-            drop table if exists symlinks;
-            create table symlinks(
-                id integer primary key autoincrement,
-                parentdir text,
-                name text,
-                path text,
-                target text,
-                type integer,
-                xxh64be integer,
-                dbsession integer not null,
-                UNIQUE(parentdir,name,dbsession)
-            );
-            create index symlinks_path_idx on symlinks(path);
 
             drop table if exists postops;
             create table postops (
@@ -229,19 +204,17 @@ class DDB():
         return magic_id
 
     def sync_db(self):
-        def sync_one(table,vec):
-            if len(vec)>0 and (isinstance(vec[0],tuple) or isinstance(vec[0],list)):
-                self.cur.executemany(f'insert or replace into {table} values ({",".join("?" for k in vec[0])})', vec)
-                vec.clear()
-        for k,v in self.dbcache_insert.items():
-            #print((k,v))
-            sync_one(k,v)
+        vec=self.dbcache_insert
+        if len(vec)>0 and (isinstance(vec[0],tuple) or isinstance(vec[0],list)):
+            self.cur.executemany(f'insert or replace into entries values ({",".join("?" for k in vec[0])})', vec)
+            vec.clear()
         self.conn.commit()
 
-    def insert_db(self,vec,table, sync=False):
+    def insert_db(self,vec, sync=False):
+        """Insert line in DB with some caching in order to perform the real insert/commit in batch (for performance) rather than one-by-one"""
         if len(vec)==0:
             return
-        self.dbcache_insert[table].append(vec)
+        self.dbcache_insert.append(vec)
         mytime2=time.time()
         if sync or mytime2-self.timer_insert>DB_COMMIT_PERIODICITY:
             self.sync_db()
@@ -249,6 +222,7 @@ class DDB():
             #self.cur.execute(f'insert or replace into {table} values ({",".join("?" for k in vec)})', vec) #q = '(' + '?,' * (len(vec)-1) + '?)'
 
     def dirscan(self, bdir, init_path=None, parentdir=None, dirstat=None, dirlevel=0):
+        """Recursively scan a dir/ (taking care of encoding issues), compute checksums and store metadata in the DB"""
         if isinstance(bdir,str):
             bdir=bytes(bdir, encoding='utf-8') # This avoids issues when walking through a filesystem with various encodings...
         def dbpath(path):
@@ -304,16 +278,37 @@ class DDB():
                 ltarget = os.readlink(path)
                 lxxh = xxhash.xxh64(name + ' -> ' + ltarget).intdigest() - (1<<63)
                 dircontents.append(lxxh)
-                res = (None, os.path.dirname(path_in_db), name_printable, path_in_db, ltarget, 0, lxxh, self.param_id)
-                self.insert_db(res,"symlinks")
+                self.insert_db((
+                    None,                               # id integer primary key autoincrement
+                    'S',                                # type: symlink
+                    path_in_db,                         # path
+                    len(os.path.dirname(path_in_db)),   # parentdir_len
+                    None,                               # size
+                    lxxh,                               # hash
+                    None, None, None,                   # magictype, nsubdirs, nsubfiles
+                    ltarget,                            # symtarget
+                    None,None,None,None,None,None,None, # struct stat is not needed
+                    self.param_id                       # dbsession
+                ))
                 entrysize=0
+                #dir_numfiles += 1 # FIXME: should we do it ?
             elif entry.is_file(follow_symlinks=False): # regular file. FIXME: sort by inode (like in https://github.com/pixelb/fslint/blob/master/fslint/findup) in order to speed up scanning ?
                 filestat = entry.stat(follow_symlinks=False)
                 entrysize = int(filestat.st_size)
                 fxxh = xxhash_file(path, entrysize)
                 mymagicid=self.magicid(path)
-                res = ( None, os.path.dirname(path_in_db), name_printable, path_in_db, entrysize, fxxh, int(filestat.st_mtime), filestat.st_mode, filestat.st_uid, filestat.st_gid, filestat.st_ino, filestat.st_nlink, filestat.st_dev, self.param_id, mymagicid )
-                self.insert_db(res,"files")
+                self.insert_db((
+                    None,                             # id integer primary key autoincrement
+                    'F',                              # type: file
+                    path_in_db,                       # path
+                    len(os.path.dirname(path_in_db)), # parentdir_len
+                    entrysize,                        # size
+                    fxxh,                             # hash
+                    mymagicid,                        # magictype
+                    None, None, None,                 # nsubdirs, nsubfiles, symtarget
+                    int(filestat.st_mtime), filestat.st_mode, filestat.st_uid, filestat.st_gid, filestat.st_ino, filestat.st_nlink, filestat.st_dev,
+                    self.param_id                     # dbsession
+                ))
                 dircontents.append(fxxh) #bisect.insort(dircontents[dir], xxh)
                 self.processedfiles+=1
                 self.processedsize+=entrysize
@@ -330,32 +325,40 @@ class DDB():
         #bisect.insort(dircontents[os.path.dirname(dir)], dirxxh)
         if dirstat==None:
             dirstat = os.lstat(dir)
-        resdir = ( None, parentdir_in_db, os.path.basename(dir_printable), dbpath(dir_printable), dirsize, dir_numfiles, dir_numdirs, dxxh, int(dirstat.st_mtime), dirstat.st_mode, dirstat.st_uid, dirstat.st_gid, dirstat.st_nlink, dirstat.st_dev, self.param_id )
-        self.insert_db(resdir,"dirs")
+        path_in_db = dbpath(dir_printable)
+        self.insert_db((
+            None,                             # id integer primary key autoincrement
+            'D',                              # type: dir
+            path_in_db,                       # path
+            len(os.path.dirname(path_in_db)), # parentdir_len
+            dirsize,                          # size
+            dxxh,                             # hash
+            None,                             # magictype
+            dir_numdirs,                      # nsubdirs
+            dir_numfiles,                     # nsubfiles
+            None,                             # symtarget
+            int(dirstat.st_mtime), dirstat.st_mode, dirstat.st_uid, dirstat.st_gid, None ,dirstat.st_nlink, dirstat.st_dev,
+            self.param_id                     # dbsession
+        ))
         return dirsize,dxxh
 
-    def walkupdate(self, init_path="/mnt/raid"): # FIXME: won't update files that changed (without deletion)
+    def walkupdate(self, init_path="/mnt/raid"):
         def fspath(dbpath):
             return init_path+'/'+dbpath
         if not os.path.exists(init_path) or not os.access(init_path, os.R_OK):
             return
         cur = self.conn.cursor()
         cur2 = self.conn.cursor()
-        for dir,dir,files in self.walk():
-            fsdir = fspath(dir)
+        for dir in cur.execute("select path from entries where path like ? and type='D' order by path", (init_path+'/%',)):
+            fsdir = fspath(dir[0])
             if not os.path.exists(fsdir) or not os.access(fsdir, os.R_OK) or not os.path.isdir(fsdir):
                 print(f"Deleting {dir} from DB")
-                cur.execute("delete from dirs where path like ?", (dir+'/%',))
-                cur.execute("delete from files where path like ?", (dir+'/%',))
-                cur.execute("delete from symlinks where path like ?", (dir+'/%',))
-                continue
-        for dir,dir,files in self.walk():
-            for file in files:
-                fsfile = fspath(file)
-                if not os.path.exists(fsfile) or not os.access(fsfile, os.R_OK): # or not os.path.isfile(fsfile):
-                    print(f"Deleting {file} from DB")
-                    cur.execute("delete from files where path like ?", (dir+'/%',))
-                    cur.execute("delete from symlinks where path like ?", (dir+'/%',))
+                cur2.execute("delete from entries where path like ?", (fsdir+'/%',)) # FIXME: will it affect current readings ?
+        for file in cur.execute("select path from entries where path like ? and (type='F' or type='S') order by path", (init_path+'/%',)):
+            fsfile = fspath(file)
+            if not os.path.exists(fsfile) or not os.access(fsfile, os.R_OK): # or not os.path.isfile(fsfile):
+                print(f"Deleting {file} from DB")
+                cur2.execute("delete from entries where path=?", (fsfile,))
 
     def computedups(self,basedir="/mnt/raid",dirsorfiles="dirs", wherepathlike='/%'):
         # select (dups-1)*size/1048576 as sz, * from dirdups where not parentdir in (select path from dirdups)
@@ -404,8 +407,8 @@ class DDB():
         for res in cur.execute('select path from dirs where path like ? order by path',(init_path+'/%',)):
             dir=res[0]
             dirs = [k[0] for k in cur2.execute('select name from dirs where parentdir=?',(dir,))]
-            files = [k[0] for k in cur2.execute('select name from files where parentdir=?',(dir,))]
-            files.append([k[0] for k in cur2.execute('select name from symlinks where parentdir=?',(dir,))])
+            files = [k[0] for k in cur2.execute("select name from entries where parentdir=? and (type='F' or type='S')",(dir,))]
+            #files.append([k[0] for k in cur2.execute('select name from symlinks where parentdir=?',(dir,))])
             yield dir,dirs,files
 
     def getincluded(self,basedir="/mnt/raid", init_path="/mnt/raid", wherepathlike='/%', resetdb=False):
@@ -803,7 +806,7 @@ if __name__ == "__main__":
         ddb=DDB(dbname)
         db2=sys.argv[5] if len(sys.argv)==6 else None
         ddb.isincluded(basedir,sys.argv[4],db2)
-    elif opmode=='FUSEFS':
+    elif opmode=='MOUNT':
         FUSE(DDBfs(dbname), basedir, nothreads=True, foreground=True)
     elif opmode=='DUPDIRS':
         ddb=DDB(dbname)
