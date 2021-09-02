@@ -133,7 +133,7 @@ class DDB():
                 type CHAR(1) NOT NULL,
                 path text UNIQUE NOT NULL,
                 parentdir_len integer,
-                parentdir text GENERATED ALWAYS AS (substr(path,0,parentdir_len+1)) VIRTUAL,
+                parentdir text GENERATED ALWAYS AS (substr(path,1,parentdir_len)) VIRTUAL,
                 name text GENERATED ALWAYS AS (substr(path,parentdir_len+2)) VIRTUAL,
                 size integer,
                 hash integer,
@@ -240,14 +240,15 @@ class DDB():
 
         #print((bdir,processed,init_path,parentdir,self.mytime))
         dir,dir_printable = mydecode_path(bdir)
+        parentdir_len = 0
         if init_path==None:
             init_path=dir.rstrip('/')
             print("\n==== Starting scan ====\n")
             self.cur.execute('insert or replace into dbsessions values (null, ?,?)', (int(self.timer_print), init_path))
             self.param_id=self.cur.lastrowid
-            parentdir_in_db = '/'
-        else:
-            parentdir_in_db = dbpath(parentdir)
+        elif parentdir!='/':
+            parentdir_len = len(dbpath(parentdir))
+        curdir_len = len(dbpath(dir))
 
         if hasattr(self,'dbcache_dirs'): # Resume / speedup scan
             mypath=dbpath(dir_printable)
@@ -282,7 +283,7 @@ class DDB():
                     None,                               # id integer primary key autoincrement
                     'S',                                # type: symlink
                     path_in_db,                         # path
-                    len(os.path.dirname(path_in_db)),   # parentdir_len
+                    curdir_len,                         # parentdir_len
                     None,                               # size
                     lxxh,                               # hash
                     None, None, None,                   # magictype, nsubdirs, nsubfiles
@@ -301,7 +302,7 @@ class DDB():
                     None,                             # id integer primary key autoincrement
                     'F',                              # type: file
                     path_in_db,                       # path
-                    len(os.path.dirname(path_in_db)), # parentdir_len
+                    curdir_len,                       # parentdir_len
                     entrysize,                        # size
                     fxxh,                             # hash
                     mymagicid,                        # magictype
@@ -330,7 +331,7 @@ class DDB():
             None,                             # id integer primary key autoincrement
             'D',                              # type: dir
             path_in_db,                       # path
-            len(os.path.dirname(path_in_db)), # parentdir_len
+            parentdir_len,                    # parentdir_len
             dirsize,                          # size
             dxxh,                             # hash
             None,                             # magictype
@@ -647,10 +648,13 @@ class DDBfs(Operations):
         for src in cur.execute("select path from postops where op='rmdir'"):
             self.rmdir[src]=''
 
+    def dbpath(self,path1):
+        path=path1.replace("/", self.init_path, 1).rstrip('/')
+        return path
+
     #@logme
     def readdir(self, path1, offset):
-        path=path1.replace("/", self.init_path, 1).rstrip('/')
-        #print('readdir ' + path)
+        path=self.dbpath(path1)
         cur = self.conn.cursor()
         res=['.', '..']
         rs1 = cur.execute("select name from dirs where parentdir=?", (path,)).fetchall()
@@ -674,7 +678,7 @@ class DDBfs(Operations):
 
     #@logme
     def open(self, path1, flags):
-        path=path1.replace("/", self.init_path, 1).rstrip('/')
+        path=self.dbpath(path1)
         cur = self.conn.cursor()
         rs = cur.execute("select xxh64be from files where path=?", (path,)).fetchall()
         if not rs:
@@ -684,7 +688,7 @@ class DDBfs(Operations):
 
     #@logme
     def read(self, path1, size, offset, fh=None):
-        path=path1.replace("/", self.init_path, 1).rstrip('/')
+        path=self.dbpath(path1)
         #print('read %s : %d' % (path, size))
         cur = self.conn.cursor()
         rs = cur.execute("select xxh64be,size from files where path=?", (path,)).fetchall()
@@ -704,9 +708,10 @@ class DDBfs(Operations):
                 st[k] = 1000
             st['st_mode'] = stat.S_IFDIR | 0o755
             return st
-        path=path1.replace("/", self.init_path, 1).rstrip('/')
+        path=self.dbpath(path1)
         cur = self.conn.cursor()
         rs = cur.execute("select size, st_mtime, st_mode, st_uid, st_gid, st_dev, xxh64be as st_ino, 2 as st_nlink from dirs where path=?", (path,)).fetchall()
+        #print(f"getattr {path1} {path} {rs}")
         if not rs:
             rs = cur.execute("select size, st_mtime, st_mode, st_uid, st_gid, st_dev, xxh64be as st_ino, st_nlink, xxh64be from files where path=?", (path,)).fetchall() # FIXME: should I leave the real st_ino ?
         if not rs:
@@ -726,7 +731,7 @@ class DDBfs(Operations):
 
     #@logme
     def readlink(self,path1):
-        path=path1.replace("/", self.init_path, 1).rstrip('/')
+        path=self.dbpath(path1)
         cur = self.conn.cursor()
         rs = cur.execute("select target from symlinks where path=?", (path,)).fetchall()
         return rs[0][0]
