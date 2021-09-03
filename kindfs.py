@@ -24,6 +24,7 @@ from fuse import FUSE, Operations #FuseOSError
 import magic
 import re
 from termcolor import colored
+import argparse
 
 try:
     from os import scandir, walk
@@ -361,12 +362,11 @@ class DDB():
                 print(f"Deleting {file} from DB")
                 cur2.execute("delete from entries where path=?", (fsfile,))
 
-    def computedups(self,basedir="/mnt/raid",dirsorfiles="dirs", wherepathlike='/%'):
+    def computedups(self,basedir=None,dirsorfiles="dirs", wherepathlike='/%'):
         # select (dups-1)*size/1048576 as sz, * from dirdups where not parentdir in (select path from dirdups)
         cur = self.conn.cursor()
         cur2 = self.conn.cursor()
         print("Computing duplicates...")
-        print("___ " + basedir + " ___")
         cur.executescript(f'''
             create temp table tmp(parentdir text, path text, xxh64be integer, size integer, dups integer);
             insert into tmp select parentdir,path,xxh64be,size,foo.dups from {dirsorfiles} inner join (select count(*) as dups, xxh64be as xxh from {dirsorfiles} group by xxh64be having count(*)>1) foo on {dirsorfiles}.xxh64be=xxh where path like '{wherepathlike}';
@@ -382,7 +382,7 @@ class DDB():
             paths = []
             l=0
             for k in rs2:
-                if basedir!='':
+                if basedir!='' and basedir!=None:
                     mystr = basedir+k[0] if os.path.exists(basedir+k[0]) else colored(basedir+k[0], 'red')
                     l += 1 if os.path.exists(basedir+k[0]) and not "syncthing" in (basedir+k[0]) else 0
                     paths.append(mystr)
@@ -534,7 +534,7 @@ class DDB():
             if(foo1!=foo2 and pdir1==pdir2):
                 print(foo1 + ' | ' + foo2 + ' -> ' + pdir1)
 
-    def dumpdir(self, adir):
+    def dumpdir(self, adir=''):
         cur = self.conn.cursor()
         for line in cur.execute("select path,xxh64be,size from dirs where path like ? order by path", (adir+'/%',)):
             (path,xxh64be,size) = line
@@ -544,7 +544,7 @@ class DDB():
         cur = self.conn.cursor()
         return cur.execute("select sum(size) from files").fetchall()[0][0]
 
-    def isincluded(self, path_test, path_ref, otherddbfs=None, excluded="",docount=True,displaytrue=False,basedir="/mnt/raid/adrien/Musique", checkfs=True): #basedir="/mnt/raid"
+    def isincluded(self, path_test, path_ref, otherddbfs=None, excluded="",docount=True,displaytrue=False,basedir="", checkfs=True):
         """Checks whether every file under path_test/ (and subdirs) has a copy somewhere in path_ref (regardless of the directory structure in path_ref/ )"""
         cur = self.conn.cursor()
         if otherddbfs:
@@ -621,6 +621,53 @@ class DDB():
             rs2=cur2.execute("select path from files where xxh64be=? and size=? and parent=?", (xxh, size, dir2)).fetchall()
             if len(rs2)==0:
                 print("%s has no equivalent" % (path))
+
+    def migrate(self):
+        self.conn.create_function("get_parentdir_len", 1, lambda x: 0 if os.path.dirname(x)=='/' else len(os.path.dirname(x)))
+        tables = [k[0] for k in self.cur.execute("select name from sqlite_master where type='table'").fetchall()]
+        if 'files' in tables and 'dirs' in tables and not 'entries' in tables:
+            print("Migrating DB")
+            self.cur.executescript('''
+                drop table if exists entries;
+                create table entries(
+                    id integer primary key autoincrement,
+                    type CHAR(1) NOT NULL,
+                    path text UNIQUE NOT NULL,
+                    parentdir_len integer,
+                    parentdir text GENERATED ALWAYS AS (substr(path,1,parentdir_len)) VIRTUAL,
+                    name text GENERATED ALWAYS AS (substr(path,parentdir_len+2)) VIRTUAL,
+                    size integer,
+                    hash integer,
+                    magictype integer,
+                    nsubdirs integer,
+                    nsubfiles integer,
+                    symtarget text,
+                    st_mtime integer, st_mode integer, st_uid integer, st_gid integer, st_ino integer, st_nlink integer, st_dev integer,
+                    dbsession integer not null
+                );
+                create index entries_type_idx on entries(type);
+                create index entries_parentdir_idx on entries(parentdir);
+                create index entries_name_idx on entries(name);
+                create index entries_path_idx on entries(path);
+                create index entries_size_idx on entries(size);
+                create index entries_hash_idx on entries(hash);
+
+                insert into entries(type, path, parentdir_len, size, hash, magictype, st_mtime, st_mode, st_uid, st_gid, st_ino, st_nlink, st_dev, dbsession)
+                select 'F', path, get_parentdir_len(path), size, xxh64be, magictype, st_mtime, st_mode, st_uid, st_gid, st_ino, st_nlink, st_dev, dbsession from files;
+
+                insert into entries(type, path, parentdir_len, hash, symtarget, dbsession)
+                select 'S', path, get_parentdir_len(path), xxh64be, target, dbsession from symlinks;
+
+                insert into entries(type, path, parentdir_len, size, hash, st_mtime, st_mode, st_uid, st_gid, st_nlink, st_dev, nsubfiles, nsubdirs, dbsession)
+                select 'D', path, get_parentdir_len(path), size, xxh64be, st_mtime, st_mode, st_uid, st_gid, st_nlink, st_dev, nsubfiles, nsubdirs, dbsession from dirs;
+
+                drop table files;
+                drop table symlinks;
+                drop table dirs;
+                create view files as select id,parentdir,name,path,size,hash as xxh64be,st_mtime, st_mode, st_uid, st_gid, st_ino, st_nlink, st_dev,dbsession,magictype from entries where type='F';
+                create view dirs as select id,parentdir,name,path,size,nsubfiles,nsubdirs,hash as xxh64be,st_mtime, st_mode, st_uid, st_gid, st_nlink, st_dev,dbsession,magictype from entries where type='D';
+                create view symlinks as select id,parentdir,name,path,symtarget as target,NULL as type,hash as xxh64be,dbsession,magictype from entries where type='S';
+            ''')
 
 
 ######################################################
@@ -765,35 +812,52 @@ class DDBfs(Operations):
         cur = self.conn.cursor()
         cur.execute('insert into postops values (null,?,?,?,?)', ('rmdir', os.path.dirname(path), path, null))
 
-def usage():
-    print('RESETDB <dbfile> <path> | SCAN <dbfile> <path> | FUSEFS <dbfile> <path>')
 
 ############################################
 # Main
 
-globalsize=0
 if __name__ == "__main__":
-    if len(sys.argv)<4:
-        usage()
-        exit()
-    opmode=sys.argv[1]
-    dbname=sys.argv[2]
-    basedir=sys.argv[3]
-    if opmode in ('SCAN', 'RESETDB'):
-        print((dbname,basedir, len(sys.argv)))
-        #refdb = sys.argv[4] if len(sys.argv)==5 else None
-        ddb=DDB(dbname, resumedb=True)
-        if opmode=='RESETDB':
-            #statvfs=os.statvfs(init_path)
-            #statvfs_total = (statvfs.f_frsize*statvfs.f_blocks)>>20
-            #statvfs_avail = (statvfs.f_frsize*(statvfs.f_bfree))>>20
-            #statvfs_used = (statvfs.f_frsize*(statvfs.f_blocks-statvfs.f_bfree))>>20
-            #cur = self.conn.cursor()
-            #self.processedsize = cur.execute("select sum(files.size) from files").fetchall()[0][0]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("dbfile", help="DB path")
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+
+    parser_scan = subparsers.add_parser('scan', help="Scan directory")
+    parser_scan.add_argument("path", help="path to scan")
+    parser_scan.add_argument("--resetdb", "-R", help="Reset DB", action='store_true', default=False)
+
+    parser_mount = subparsers.add_parser('mount')
+    parser_mount.add_argument("mountpoint", help="Mount point")
+
+    parser_isincluded = subparsers.add_parser('isincluded', help="Check whether all files in dirA/ are included in dirB/")
+    parser_isincluded.add_argument('dirA', help="source dir")
+    parser_isincluded.add_argument('dirB', help="dest dir")
+    parser_isincluded.add_argument("--otherdb", "-o", help="otherdb", default=None)
+    parser_isincluded.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default=None)
+
+    parser_comparedb = subparsers.add_parser('comparedb', help="Compare two DB")
+    parser_comparedb.add_argument('otherdb', help="DB to compare with")
+
+    parser_migrate = subparsers.add_parser('migrate', help="Migrate DB schema")
+
+    parser_diff = subparsers.add_parser('diff', help="Show diffs between dirA/ and dirB/")
+    parser_diff.add_argument('dirA', help="source dir")
+    parser_diff.add_argument('dirB', help="dest dir")
+
+    parser_dupfiles = subparsers.add_parser('dupfiles', help="show duplicate files")
+    parser_dupfiles.add_argument("--mountpoint", "-d", help="mountpoint for checking whether files are still present", default=None)
+    parser_dupdirs = subparsers.add_parser('dupdirs', help="show duplicate dirs")
+    parser_dupdirs.add_argument("--mountpoint", "-d", help="mountpoint for checking whether files are still present", default=None)
+
+    parser_dump=subparsers.add_parser('dump', help="dump DB")
+    parser_dump.add_argument("--basedir", "-b", help="Basedir", default='')
+
+    args = parser.parse_args()
+
+    if args.subcommand=='scan':
+        ddb=DDB(args.dbfile, resumedb=True)
+        if args.resetdb:
             ddb.createdb()
             ddb.conn.commit()
-        #scansubdir=sys.argv[4] if len(sys.argv)==5 else ''
-        #ddb.conn.execute('BEGIN')
         try:
             ddb.dirscan(basedir)
             ddb.sync_db()
@@ -801,35 +865,32 @@ if __name__ == "__main__":
         except(KeyboardInterrupt):
             ddb.sync_db()
             allsize = ddb.dbgsize()
-            print("\n_________________\nkeyboard interrupt, %d processed, %d stored" % (globalsize>>20, allsize>>20))
+            print("\n_________________\nkeyboard interrupt, %d stored" % (allsize>>20))
             ddb.conn.close()
-
-    elif opmode=='DUMP':
-        ddb=DDB(dbname)
-        ddb.dumpdir(basedir)
-    elif opmode=='ISINCLUDED':
-        ddb=DDB(dbname)
-        db2=sys.argv[5] if len(sys.argv)==6 else None
-        ddb.isincluded(basedir,sys.argv[4],db2)
-    elif opmode=='MOUNT':
-        FUSE(DDBfs(dbname), basedir, nothreads=True, foreground=True)
-    elif opmode=='DUPDIRS':
-        ddb=DDB(dbname)
-        ddb.computedups(basedir)
-    elif opmode=='DUPFILES':
-        ddb=DDB(dbname)
-        ddb.computedups(basedir, dirsorfiles='files')
-    elif opmode=='GETINCLUDED':
-        ddb=DDB(dbname)
-        ddb.getincluded(basedir)
-    elif opmode=='COMPAREDB':
-        # FIXME: change "basedir" to better variable name
-        ddb=DDB(dbname)
-        print(f"Files from {dbname} that are not in {basedir} (deleted files)")
-        ddb.isincluded('','',otherddbfs=basedir,basedir='',checkfs=False)
-        #ddb=DDB(basedir)
-        #print(f"\n_________\nFiles from {basedir} that are not in {dbname}  (new files)")
-        #ddb.isincluded('','',otherddbfs=dbname,basedir='',checkfs=False)
-    else:
-        usage()
-    print()
+    elif args.subcommand=='dump': # FIXME: change it to table "entries" instead of "dirs"
+        ddb=DDB(args.dbfile)
+        ddb.dumpdir(args.basedir)
+    elif args.subcommand=='isincluded':
+        ddb=DDB(args.dbfile)
+        ddb.isincluded(args.dirA, args.dirB, args.otherdb, basedir=args.mountpoint)
+    elif args.subcommand=='diff':
+        ddb=DDB(args.dbfile)
+        ddb.diff(args.dirA, args.dirB)
+    elif args.subcommand=='mount':
+        FUSE(DDBfs(args.dbfile), args.mountpoint, nothreads=True, foreground=True)
+    elif args.subcommand=='dupdirs':
+        ddb=DDB(args.dbfile)
+        ddb.computedups(basedir=args.mountpoint)
+    elif args.subcommand=='dupfiles':
+        ddb=DDB(args.dbfile)
+        ddb.computedups(basedir=args.mountpoint, dirsorfiles='files')
+    elif args.subcommand=='comparedb':
+        print(f"Files from {args.dbfile} that are not in {args.otherdb} (i.e. deleted files)")
+        ddb=DDB(args.dbfile)
+        ddb.isincluded('', '', otherddbfs=args.otherdb, basedir='', checkfs=False)
+        print(f"\n_________\nFiles from {args.otherdb} that are not in {args.dbfile} (i.e. new files)")
+        ddb=DDB(args.otherdb)
+        ddb.isincluded('', '', otherddbfs=args.dbfile, basedir='', checkfs=False)
+    elif args.subcommand=='migrate':
+        ddb=DDB(args.dbfile)
+        ddb.migrate()
