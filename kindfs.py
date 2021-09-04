@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # Author: Adrien Demarez (adrien.demarez@free.fr)
-# Version: 20210411
 # License: GPLv3
 # Prerequisite : pip install xxhash numpy fusepy python-magic
 # Beware : this software only hashes portions of files for speed (and therefore may consider that some files/dirs are identical when they are not really). Use this program at your own risk and only when you know what you are doing ! (and double-check with filenames + if unsure, triple-check with full md5sum or diff -r !)
@@ -25,6 +24,7 @@ import magic
 import re
 from termcolor import colored
 import argparse
+import shutil
 
 try:
     from os import scandir, walk
@@ -55,14 +55,31 @@ def xxhash_file(filename, filesize=None, chunksize=FILE_HASH_CHUNKSIZE, inclsize
         digest.update(os.path.basename(filename))
     with open(filename,'rb') as fh:
         if(filesize<=3*CHUNKSIZE):
-            digest.update(fh.read())
+            data = fh.read()
+            notallzeros = any(data)
+            digest.update(data)
         else:
-            digest.update(fh.read(CHUNKSIZE))
+            data = fh.read(CHUNKSIZE)
+            notallzeros = any(data)
+            digest.update(data)
+
             fh.seek(math.floor(filesize/2-CHUNKSIZE/2))
-            digest.update(fh.read(CHUNKSIZE))
+            data = fh.read(CHUNKSIZE)
+            notallzeros = notallzeros | any(data)
+            digest.update(data)
+
             fh.seek(filesize-CHUNKSIZE)
-            digest.update(fh.read(CHUNKSIZE))
-    return digest.intdigest() - (1<<63) # return integer rather than hexdigest because it is more efficient. "- (1<<63)" is there because SQLite3 unfortunately only supports signed 64 bits integers and doesn't support unsigned
+            data = fh.read(CHUNKSIZE)
+            notallzeros = notallzeros | any(data)
+            digest.update(data)
+    res = digest.intdigest() if notallzeros else 0
+    return res - (1<<63) # return integer rather than hexdigest because it is more efficient. "- (1<<63)" is there because SQLite3 unfortunately only supports signed 64 bits integers and doesn't support unsigned
+
+def check_zerofile(filename):
+    with open(filename,'rb') as fh:
+        k = not any(fh.read())
+        print(k)
+        return k
 
 def mydecode_path(pathbytes,fixparts=False):
     # In worst cases, there may be a mix of encoding in the path (e.g. beginning as utf8, and starting from some point some subdirs as iso8859, and deeper in the path again some utf8). The best way would be to use convmv to fix the issue before running this script. However in real life there may not always be a way to fix the data prior to processing, and I don't want the script to fail miserably in those cases => therefore here we return two decoded string : a first string with "surrogateescape" that can be used by os.* file methods (but cannot be printed or really used as string), and another string which cannot be used by file methods (it doesn't correspond to a valid path on the filesystem) but can be printed and manipulated (and inserted in the DB). For the latter, there are two options : either use error="replace" (default behavior), or fix every subsection of the path (slower, will convert every part nicely to utf8 for printing, but will also hide under the carpet that there is an issue that deserves to be fixed with convmv on this section of the filesystem)
@@ -361,6 +378,28 @@ class DDB():
             if not os.path.exists(fsfile) or not os.access(fsfile, os.R_OK): # or not os.path.isfile(fsfile):
                 print(f"Deleting {file} from DB")
                 cur2.execute("delete from entries where path=?", (fsfile,))
+
+    def compute_dupfiles(self,basedir=None):
+        if basedir==None:
+            basedir=""
+        cur = self.conn.cursor()
+        cur2 = self.conn.cursor()
+        print("Computing duplicates...")
+        rs1 = cur.execute('select xxh64be,size,count(*) from files group by xxh64be,size having count(*)>1 order by size desc limit 10')
+        print("Second phase")
+        for xxh,size,ndups in rs1:
+            paths = []
+            rs2 = cur2.execute('select xxh64be,size,path from files where xxh64be=? and size=?', (xxh,size))
+            for xxh2,size2,path in rs2:
+                if basedir!='' and basedir!=None and not os.path.exists(basedir+path):
+                    path_real = colored(basedir+path, 'red')
+                else:
+                    path_real = basedir+path
+                path_real = f'{xxh2+(1<<63):0>16x} {size2>>20} : {path_real}'
+                if not 'syncthing' in path_real and not 'lost+found' in path_real:
+                    paths.append(path_real)
+            print(colored("0x%016x, %d * %d Mo :" % (xxh+(1<<63), ndups, size>>20), 'yellow'))
+            print('\t'+'\n\t'.join(paths))
 
     def computedups(self,basedir=None,dirsorfiles="dirs", wherepathlike='/%'):
         # select (dups-1)*size/1048576 as sz, * from dirdups where not parentdir in (select path from dirdups)
@@ -838,6 +877,7 @@ if __name__ == "__main__":
     parser_comparedb.add_argument('otherdb', help="DB to compare with")
 
     parser_migrate = subparsers.add_parser('migrate', help="Migrate DB schema")
+    parser_migrate.add_argument('newdb', help="New DB filename with updated schema")
 
     parser_diff = subparsers.add_parser('diff', help="Show diffs between dirA/ and dirB/")
     parser_diff.add_argument('dirA', help="source dir")
@@ -851,22 +891,27 @@ if __name__ == "__main__":
     parser_dump=subparsers.add_parser('dump', help="dump DB")
     parser_dump.add_argument("--basedir", "-b", help="Basedir", default='')
 
+    subparsers.add_parser('computehash', help="Compute hash")
+    subparsers.add_parser('check_zerofile', help="Check whether file is made only of zeros (e.g. corrupted)")
+
     args = parser.parse_args()
 
     if args.subcommand=='scan':
-        ddb=DDB(args.dbfile, resumedb=True)
         if args.resetdb:
-            ddb.createdb()
-            ddb.conn.commit()
+            os.remove(args.dbfile)
+            #ddb.createdb()
+            #ddb.conn.commit()
+        ddb=DDB(args.dbfile, resumedb=True)
         try:
             ddb.dirscan(basedir)
             ddb.sync_db()
             ddb.conn.close()
         except(KeyboardInterrupt):
             ddb.sync_db()
-            allsize = ddb.dbgsize()
-            print("\n_________________\nkeyboard interrupt, %d stored" % (allsize>>20))
             ddb.conn.close()
+            print("\n_________________\nkeyboard interrupt !")
+            #allsize = ddb.dbgsize()
+            #print("\n_________________\nkeyboard interrupt, %d stored" % (allsize>>20))
     elif args.subcommand=='dump': # FIXME: change it to table "entries" instead of "dirs"
         ddb=DDB(args.dbfile)
         ddb.dumpdir(args.basedir)
@@ -883,7 +928,7 @@ if __name__ == "__main__":
         ddb.computedups(basedir=args.mountpoint)
     elif args.subcommand=='dupfiles':
         ddb=DDB(args.dbfile)
-        ddb.computedups(basedir=args.mountpoint, dirsorfiles='files')
+        ddb.compute_dupfiles(basedir=args.mountpoint)
     elif args.subcommand=='comparedb':
         print(f"Files from {args.dbfile} that are not in {args.otherdb} (i.e. deleted files)")
         ddb=DDB(args.dbfile)
@@ -892,5 +937,13 @@ if __name__ == "__main__":
         ddb=DDB(args.otherdb)
         ddb.isincluded('', '', otherddbfs=args.dbfile, basedir='', checkfs=False)
     elif args.subcommand=='migrate':
-        ddb=DDB(args.dbfile)
+        shutil.copyfile(args.dbfile, args.newdb)
+        ddb=DDB(args.newdb)
         ddb.migrate()
+    elif args.subcommand=='computehash':
+        filestat = os.stat(args.dbfile)
+        entrysize = int(filestat.st_size)
+        fxxh = xxhash_file(args.dbfile, entrysize)
+        print("0x%016x, %d : %s" % (fxxh+(1<<63), entrysize, args.dbfile))
+    elif args.subcommand=='check_zerofile':
+        check_zerofile(args.dbfile)
