@@ -103,31 +103,34 @@ def mydecode_path(pathbytes,fixparts=False):
 # DB class
 
 class DDB():
-    def __init__(self, dbname, domagic=False, resumedb=False):
+    def __init__(self, dbname, domagic=False, rw=False):
         self.dbname=dbname
         self.conn = sqlite3.connect(dbname)
+        self.conn.create_function("get_parentdir_len", 1, lambda x: 0 if os.path.dirname(x)=='/' else len(os.path.dirname(x)))
         self.cur = self.conn.cursor()
         self.processedfiles = 0
         self.processedsize = 0
-        if resumedb:
+        if rw==True:
             print('Looking for resume')
             tables = [k[0] for k in self.cur.execute("select name from sqlite_master where type='table'").fetchall()]
-            if 'files' in tables and 'dirs' in tables:
-                #emptyf = self.cur.execute("select count(*),sum(size) from files").fetchall()
-                #emptyf = self.cur.execute("select id from files limit 2").fetchall()
-                mydirs = self.cur.execute("select path,size,xxh64be,nsubfiles from dirs").fetchall()
+            if 'entries' in tables:
+                mydirs = self.cur.execute("select path,size,hash,nsubfiles from entries where type='D'").fetchall()
                 if len(mydirs)>0:
                     print("Resuming from previous scan")
+                    self.dbcache_dirs = {k[0]:[k[1],k[2],k[3]] for k in mydirs}
+                    self.cur.execute("delete from entries where type in ('F', 'S') and not parentdir in (select path from entries where type='D')")
+                    #emptyf = self.cur.execute("select count(*),sum(size) from files").fetchall()
                     #self.processedfiles=emptyf[0][0]
                     #self.processedsize=emptyf[0][1]
-                    self.dbcache_dirs = {k[0]:[k[1],k[2],k[3]] for k in mydirs}
-                    #self.cur_ref = self.conn.cursor()
-                    self.cur.execute("delete from files where not parentdir in (select path from dirs)")
                 else:
                     print('No existing entries')
+            elif 'dirs' in tables or 'files' in tables:
+                sys.exit('Old DB schema. Migrate first !')
             else:
                 print('No existing tables')
                 self.createdb()
+        else:
+            self.conn.execute("PRAGMA temp_store = MEMORY") # "pragma query_only = ON" does not enable temp views...
         #self.init_path=init_path.rstrip('/')
         self.magictypes = {}
         self.domagic=domagic
@@ -144,6 +147,7 @@ class DDB():
         print("Creating / resetting DB")
         cur = self.conn.cursor()
         # Create the DB. Notice that 'path' is duplicate information for 'parentdir/name' which may seem suboptimal, yet it is useful to have both for performance in various situations when using indexes (e.g. indexed full path is useful for FUSE)
+        # TODO: add nsubfiles_tot for cumulative info on subfiles for dirs
         cur.executescript('''
             drop table if exists entries;
             create table entries(
@@ -379,13 +383,51 @@ class DDB():
                 print(f"Deleting {file} from DB")
                 cur2.execute("delete from entries where path=?", (fsfile,))
 
-    def compute_dupfiles(self,basedir=None):
+    def compute_duptable(self):
+        cur = self.conn.cursor()
+        print("Computing duplicates...")
+        cur.executescript('''
+            drop table if exists cachedups;
+            create table cachedups (parentdir_len text, path text, type integer, hash integer, size integer, ndups integer, parentdir text GENERATED ALWAYS AS (substr(path,1,parentdir_len)) VIRTUAL);
+            create index cachedups_path_idx on cachedups(path);
+            create index cachedups_hash_idx on cachedups(hash);
+            create index cachedups_size_idx on cachedups(size);
+
+            insert into cachedups select parentdir_len,path,type,entries.hash,entries.size,ndups from entries inner join (select count(*) as ndups, hash, size from entries group by hash,size,type having count(*)>1) foo on entries.hash=foo.hash where entries.size=foo.size order by entries.size desc;
+        ''')
+        # select size,ndups,path,type,hash from cachedups where not parentdir in (select path from cachedups) order by size desc
+
+    def showdups(self,basedir="",nres=None):
+        cur = self.conn.cursor()
+        cur2 = self.conn.cursor()
+        tables = [k[0] for k in self.cur.execute("select name from sqlite_master where type='table'").fetchall()]
+        if not 'cachedups' in tables:
+            self.compute_duptable()
+        limit_nres = f'limit {int(nres)}' if nres else ''
+        rs = cur.execute(f"select type,path,size,hash,ndups,parentdir from cachedups order by size desc {limit_nres}") #where not parentdir in (select path from cachedups)
+        for ftype,path,size,hash,ndups,parentdir in rs:
+            pdir_isdup = cur2.execute("select count(*) from cachedups where path=?", (parentdir,)).fetchall()[0][0]
+            path_real = basedir+path
+            if basedir!='' and basedir!=None and not os.path.exists(basedir+path):
+                path_real = colored(path_real, 'red')
+            elif pdir_isdup>0:
+                path_real = colored(path_real, 'cyan') + colored(' [parent dir already in dups]', 'yellow')
+            elif 'syncthing' in path_real or 'lost+found' in path_real:
+                path_real = colored(path_real, 'cyan')
+
+            #if not 'syncthing' in path_real and not 'lost+found' in path_real:
+            print(colored(f"{ftype} 0x{hash+(1<<63):0>16x}, {ndups} * {size>>20} Mo : ", 'yellow') + path_real)
+            #print(colored(f"{ftype} {hash}, {ndups} * {size>>20} Mo : ", 'yellow') + path_real)
+
+    def compute_dupfiles(self,basedir=None,nres=None):
+        # This function will probably be superseded soon (by showdups())
         if basedir==None:
             basedir=""
+        limit_nres = f'limit {int(nres)}' if nres else ''
         cur = self.conn.cursor()
         cur2 = self.conn.cursor()
         print("Computing duplicates...")
-        rs1 = cur.execute('select xxh64be,size,count(*) from files group by xxh64be,size having count(*)>1 order by size desc limit 10')
+        rs1 = cur.execute(f'select xxh64be,size,count(*) from files group by xxh64be,size having count(*)>1 order by size desc {limit_nres}')
         print("Second phase")
         for xxh,size,ndups in rs1:
             paths = []
@@ -395,51 +437,42 @@ class DDB():
                     path_real = colored(basedir+path, 'red')
                 else:
                     path_real = basedir+path
-                path_real = f'{xxh2+(1<<63):0>16x} {size2>>20} : {path_real}'
                 if not 'syncthing' in path_real and not 'lost+found' in path_real:
                     paths.append(path_real)
-            print(colored("0x%016x, %d * %d Mo :" % (xxh+(1<<63), ndups, size>>20), 'yellow'))
+            print(colored(f"0x{xxh+(1<<63):0>16x}, {ndups} * {size>>20} Mo :", 'yellow'))
             print('\t'+'\n\t'.join(paths))
 
-    def computedups(self,basedir=None,dirsorfiles="dirs", wherepathlike='/%'):
+    def compute_dupdirs(self,basedir=None,dirsorfiles="dirs", wherepathlike='/%', nres=None):
+        # This function will probably be superseded soon (by showdups())
         # select (dups-1)*size/1048576 as sz, * from dirdups where not parentdir in (select path from dirdups)
         cur = self.conn.cursor()
         cur2 = self.conn.cursor()
+        limit_nres = f'limit {int(nres)}' if nres else ''
         print("Computing duplicates...")
-        cur.executescript(f'''
-            create temp table tmp(parentdir text, path text, xxh64be integer, size integer, dups integer);
-            insert into tmp select parentdir,path,xxh64be,size,foo.dups from {dirsorfiles} inner join (select count(*) as dups, xxh64be as xxh from {dirsorfiles} group by xxh64be having count(*)>1) foo on {dirsorfiles}.xxh64be=xxh where path like '{wherepathlike}';
-            create index tmp_parentdir_idx on tmp(parentdir);
-            create index tmp_path_idx on tmp(path);
-            create index tmp_xxh64be_idx on tmp(xxh64be);
-            create index tmp_size_idx on tmp(size);
-        ''')
-        print("Second phase")
-        rs = cur.execute('select xxh64be,size,dups from tmp where parentdir not in (select path from tmp) group by xxh64be,size order by size desc limit 100')
-        for xxh,size,dups in rs:
-            rs2=cur2.execute(f'select path from {dirsorfiles} where xxh64be=?', (xxh,)).fetchall()
+        cur.executescript("""
+            create temp view duphashes_dirs as select type,hash,size,count(*) ndups from entries where type='D' group by hash,size,type having count(*)>1;
+            create temp view dupentries_dirs as select entries.type,parentdir,path,duphashes_dirs.hash,duphashes_dirs.size,ndups from entries inner join duphashes_dirs on duphashes_dirs.hash=entries.hash where entries.type='D';
+            create temp view duphashes_filtered as select type,hash,size,ndups from dupentries_dirs where parentdir not in (select path from dupentries_dirs) group by hash,size,type
+        """)
+        rs = cur.execute(f"select hash,size,ndups from duphashes_filtered where type='D' order by size desc {limit_nres}")
+        for xxh,size,ndups in rs:
+            rs2=cur2.execute(f"select path from entries where type='D' and hash=? and size=? and not path like '/syncthing/%'", (xxh,size)).fetchall()
             paths = []
             l=0
             for k in rs2:
                 if basedir!='' and basedir!=None:
                     mystr = basedir+k[0] if os.path.exists(basedir+k[0]) else colored(basedir+k[0], 'red')
-                    l += 1 if os.path.exists(basedir+k[0]) and not "syncthing" in (basedir+k[0]) else 0
+                    l += 1 if os.path.exists(basedir+k[0]) else 0 # and not "syncthing" in (basedir+k[0]) 
                     paths.append(mystr)
-                elif not 'syncthing' in k[0] and not 'lost+found' in k[0]:
+                elif not 'lost+found' in k[0]: # and not 'syncthing' in k[0]
                     mystr=k[0]
                     l+=1
                     paths.append(mystr)
+                else:
+                    print(f"Not inserting {k[0]}")
             if l>1:
-                print(colored("0x%016x, %d * %d Mo :" % (xxh+(1<<63), dups, size>>20), 'yellow'))
+                print(colored(f"0x{xxh+(1<<63):0>16x}, {ndups} * {size>>20} Mo :", 'yellow'))
                 print('\t'+'\n\t'.join(paths))
-        #rs = cur.execute('select * from tmp where parentdir not in (select path from tmp) order by size desc limit 100')
-        #for line in rs:
-            #parentdir,path,xxh,size,dups = line
-            #mystr="0x%016x, %d Mo : %s" % (xxh+(1<<63), size>>20, path)
-            #if os.path.exists(basedir+path):
-                #print(mystr)
-            #else:
-                #print (colored(mystr, 'red'))
 
     def walk(self,init_path=''):
         cur = self.conn.cursor()
@@ -662,7 +695,6 @@ class DDB():
                 print("%s has no equivalent" % (path))
 
     def migrate(self):
-        self.conn.create_function("get_parentdir_len", 1, lambda x: 0 if os.path.dirname(x)=='/' else len(os.path.dirname(x)))
         tables = [k[0] for k in self.cur.execute("select name from sqlite_master where type='table'").fetchall()]
         if 'files' in tables and 'dirs' in tables and not 'entries' in tables:
             print("Migrating DB")
@@ -883,16 +915,24 @@ if __name__ == "__main__":
     parser_diff.add_argument('dirA', help="source dir")
     parser_diff.add_argument('dirB', help="dest dir")
 
-    parser_dupfiles = subparsers.add_parser('dupfiles', help="show duplicate files")
-    parser_dupfiles.add_argument("--mountpoint", "-d", help="mountpoint for checking whether files are still present", default=None)
-    parser_dupdirs = subparsers.add_parser('dupdirs', help="show duplicate dirs")
-    parser_dupdirs.add_argument("--mountpoint", "-d", help="mountpoint for checking whether files are still present", default=None)
-
     parser_dump=subparsers.add_parser('dump', help="dump DB")
     parser_dump.add_argument("--basedir", "-b", help="Basedir", default='')
 
     subparsers.add_parser('computehash', help="Compute hash")
     subparsers.add_parser('check_zerofile', help="Check whether file is made only of zeros (e.g. corrupted)")
+
+    subparsers.add_parser('compute_duptable', help="Compute duptable")
+    parser_dupdirs = subparsers.add_parser('showdups', help="show duplicates")
+    parser_dupdirs.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default='')
+    parser_dupdirs.add_argument("--limit", "-l", help="Max number of results", default=None)
+
+    # Legacy
+    parser_dupfiles = subparsers.add_parser('dupfiles', help="show duplicate files")
+    parser_dupfiles.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default=None)
+    parser_dupfiles.add_argument("--limit", "-l", help="Max number of results", default=None)
+    parser_dupdirs = subparsers.add_parser('dupdirs', help="show duplicate dirs")
+    parser_dupdirs.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default=None)
+    parser_dupdirs.add_argument("--limit", "-l", help="Max number of results", default=None)
 
     args = parser.parse_args()
 
@@ -901,9 +941,9 @@ if __name__ == "__main__":
             os.remove(args.dbfile)
             #ddb.createdb()
             #ddb.conn.commit()
-        ddb=DDB(args.dbfile, resumedb=True)
+        ddb=DDB(args.dbfile, rw=True)
         try:
-            ddb.dirscan(basedir)
+            ddb.dirscan(args.path)
             ddb.sync_db()
             ddb.conn.close()
         except(KeyboardInterrupt):
@@ -925,10 +965,10 @@ if __name__ == "__main__":
         FUSE(DDBfs(args.dbfile), args.mountpoint, nothreads=True, foreground=True)
     elif args.subcommand=='dupdirs':
         ddb=DDB(args.dbfile)
-        ddb.computedups(basedir=args.mountpoint)
+        ddb.compute_dupdirs(basedir=args.mountpoint, nres=args.limit)
     elif args.subcommand=='dupfiles':
         ddb=DDB(args.dbfile)
-        ddb.compute_dupfiles(basedir=args.mountpoint)
+        ddb.compute_dupfiles(basedir=args.mountpoint, nres=args.limit)
     elif args.subcommand=='comparedb':
         print(f"Files from {args.dbfile} that are not in {args.otherdb} (i.e. deleted files)")
         ddb=DDB(args.dbfile)
@@ -944,6 +984,12 @@ if __name__ == "__main__":
         filestat = os.stat(args.dbfile)
         entrysize = int(filestat.st_size)
         fxxh = xxhash_file(args.dbfile, entrysize)
-        print("0x%016x, %d : %s" % (fxxh+(1<<63), entrysize, args.dbfile))
+        print(f"0x{fxxh+(1<<63):0>16x}, {entrysize>>20} Mo : {args.dbfile}")
     elif args.subcommand=='check_zerofile':
         check_zerofile(args.dbfile)
+    elif args.subcommand=='compute_duptable':
+        ddb=DDB(args.dbfile)
+        ddb.compute_duptable()
+    elif args.subcommand=='showdups':
+        ddb=DDB(args.dbfile)
+        ddb.showdups(basedir=args.mountpoint, nres=args.limit)
