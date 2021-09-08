@@ -7,7 +7,8 @@
 
 
 # Parameters
-DB_COMMIT_PERIODICITY=0.1  # flush/commit DB every x seconds. Higher values implies more RAM usage but higher I/O performance
+DB_COMMIT_PERIODICITY=5  # flush/commit DB every x seconds. Higher values implies more RAM usage but higher I/O performance
+DISPLAY_PERIODICITY=0.1
 FILE_HASH_CHUNKSIZE=1<<20  # default is to hash 1MB data at begin/middle/end of files i.e. 3MB total. Smaller values means faster scan but more risk to miss differences in files. set "None" if you want to scan 100% of the contents of your files for more safety (at the expense of scanning speed)
 
 import sqlite3,xxhash
@@ -72,8 +73,9 @@ def xxhash_file(filename, filesize=None, chunksize=FILE_HASH_CHUNKSIZE, inclsize
             data = fh.read(CHUNKSIZE)
             notallzeros = notallzeros | any(data)
             digest.update(data)
-    res = digest.intdigest() if notallzeros else 0
-    return res - (1<<63) # return integer rather than hexdigest because it is more efficient. "- (1<<63)" is there because SQLite3 unfortunately only supports signed 64 bits integers and doesn't support unsigned
+    if notallzeros:
+        return 0
+    return digest.intdigest() - (1<<63) # return integer rather than hexdigest because it is more efficient. "- (1<<63)" is there because SQLite3 unfortunately only supports signed 64 bits integers and doesn't support unsigned
 
 def check_zerofile(filename):
     with open(filename,'rb') as fh:
@@ -166,9 +168,9 @@ class DDB():
                 st_mtime integer, st_mode integer, st_uid integer, st_gid integer, st_ino integer, st_nlink integer, st_dev integer,
                 dbsession integer not null
             );
-            create index entries_type_idx on entries(type);
-            create index entries_parentdir_idx on entries(parentdir);
-            create index entries_name_idx on entries(name);
+            -- create index entries_type_idx on entries(type);
+            -- create index entries_parentdir_idx on entries(parentdir);
+            -- create index entries_name_idx on entries(name);
             create index entries_path_idx on entries(path);
             create index entries_size_idx on entries(size);
             create index entries_hash_idx on entries(hash);
@@ -251,7 +253,7 @@ class DDB():
             return path.replace(init_path, '')
         def printprogress():
             mytime2=time.time()
-            if mytime2-self.timer_print>DB_COMMIT_PERIODICITY:
+            if mytime2-self.timer_print>DISPLAY_PERIODICITY:
                 k=dbpath(dir_printable)
                 ld=len(k) - (os.get_terminal_size()[0]-40)
                 if ld>0:
@@ -418,6 +420,22 @@ class DDB():
             #if not 'syncthing' in path_real and not 'lost+found' in path_real:
             print(colored(f"{ftype} 0x{hash+(1<<63):0>16x}, {ndups} * {size>>20} Mo : ", 'yellow') + path_real)
             #print(colored(f"{ftype} {hash}, {ndups} * {size>>20} Mo : ", 'yellow') + path_real)
+
+    def show_same_inode(self,basedir="",nres=None):
+        cur = self.conn.cursor()
+        cur2 = self.conn.cursor()
+        limit_nres = f'limit {int(nres)}' if nres else ''
+        rs = cur.execute(f"select size,path,hash,st_ino,parentdir from entries where st_ino in (select st_ino from entries group by st_ino having count(*)>1 and type='F') order by size desc {limit_nres}")
+        for size,path,hash,inode,parentdir in rs:
+            pdir_isdup = cur2.execute("select count(*) from cachedups where path=?", (parentdir,)).fetchall()[0][0]
+            path_real = basedir+path
+            if basedir!='' and basedir!=None and not os.path.exists(basedir+path):
+                path_real = colored(path_real, 'red')
+            elif pdir_isdup>0:
+                path_real = colored(path_real, 'cyan') + colored(' [parent dir already in dups]', 'yellow')
+            elif 'syncthing' in path_real or 'lost+found' in path_real:
+                path_real = colored(path_real, 'cyan')
+            print(colored(f"{inode} 0x{hash+(1<<63):0>16x}, {size>>20} Mo : ", 'yellow') + path_real)
 
     def compute_dupfiles(self,basedir=None,nres=None):
         # This function will probably be superseded soon (by showdups())
@@ -631,9 +649,13 @@ class DDB():
         if not rs or mycount==0:
             print('No results !')
         res = []
+        if basedir=='':
+            checkfs=False
         for line in rs:
             name,xxh,size,path=line
             if excluded!="" and excluded in path:
+                continue
+            if checkfs and not os.path.exists(basedir+path):
                 continue
             if not otherddbfs and path_ref=='':
                 rs2=cur2.execute("select path from files where xxh64be=? and size=? and not path like ?", (xxh, size, path_test+'/%')).fetchall()
@@ -643,25 +665,18 @@ class DDB():
             else:
                 rs2=cur2.execute("select path from files where xxh64be=? and size=? and path!=? and path like ?", (xxh, size, path, path_ref+'/%')).fetchall()
                 #rs2=cur2.execute("select path from files where xxh64be=? and size=? and path!=?", (xxh, size, path)).fetchall()
-            if not rs2 and (checkfs==False or os.path.exists(basedir+path)):
-                print(colored(f"\033[2K\r  {xxh+(1<<63):0>16x}, {size>>20} Mo : {self.dbname}:{path}",'yellow'))
-                #res.append(path)
-            elif basedir!='': # FIXME: else ?
-                # Let's check on the filesystem in case the duplicates would have been deleted compared to what's in the DB
-                l=0
-                if checkfs==True and len(rs2)<=20: # FIXME: "len(rs2)>20 or" is there because of performance issues with some results that have a large number of duplicates (e.g. small system/compilation files that are identical among many projects). But this workaround is suboptimal.
-                    for dup in rs2:
-                        #print((path,rs2[0]))
-                        if not 'lost+found' in dup[0] and os.path.exists(basedir+dup[0]):
-                            l+=1
-                            break
-                else:
-                    l=len(rs2)
-                if displaytrue and l!=0:
-                    print(colored(f"\033[2K\r{path} ({size>>20} Mo) has the equivalent: {rs2}",'green'))
-                if l==0:
+
+            if not rs2:
+                print(colored(f"\033[2K\rNo equivalent for {xxh+(1<<63):0>16x}, {size>>20} Mo : {self.dbname}:{path}",'yellow'))
+            else:
+                # Even if there are results, we should check whether they still exist (when checkfs==True) in case they might have been deleted since previous scan
+                # FIXME: we restrict to the 20 first dups as otherwise there is a performance issue for rare cases with large number of results (e.g. small system/compilation files that are identical among many projects). But this workaround is suboptimal.
+                is_dup_real=True if checkfs==False else any([os.path.exists(basedir+dup[0]) for dup in rs2[:20]])
+                if not is_dup_real:
                     print(colored(f"\033[2K\rNo equivalent anymore for ({size>>20} Mo) : {path}",'red'))
                     res.append(path)
+                elif displaytrue:
+                    print(colored(f"\033[2K\r{path} ({size>>20} Mo) has the equivalent: {rs2}",'green'))
             mytime2=time.time()
             if mytime2-self.timer_print>0.05:
                 sys.stderr.write(f"\033[2K\rScanning: [{k} / {mycount} entries, {int(100*k/mycount)}%] ")
@@ -670,7 +685,6 @@ class DDB():
             k+=1
         if otherddbfs:
             conn2.close()
-        #print('\n'.join(res))
         return res
 
     def diff(self,dir1,dir2):
@@ -903,7 +917,8 @@ if __name__ == "__main__":
     parser_isincluded.add_argument('dirA', help="source dir")
     parser_isincluded.add_argument('dirB', help="dest dir")
     parser_isincluded.add_argument("--otherdb", "-o", help="otherdb", default=None)
-    parser_isincluded.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default=None)
+    parser_isincluded.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default='')
+    parser_isincluded.add_argument("--displaytrue", "-d", help="Display all dups", action='store_true', default=False)
 
     parser_comparedb = subparsers.add_parser('comparedb', help="Compare two DB")
     parser_comparedb.add_argument('otherdb', help="DB to compare with")
@@ -933,6 +948,9 @@ if __name__ == "__main__":
     parser_dupdirs = subparsers.add_parser('dupdirs', help="show duplicate dirs")
     parser_dupdirs.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default=None)
     parser_dupdirs.add_argument("--limit", "-l", help="Max number of results", default=None)
+    parser_inodes = subparsers.add_parser('inodes', help="show duplicate dirs")
+    parser_inodes.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default=None)
+    parser_inodes.add_argument("--limit", "-l", help="Max number of results", default=None)
 
     args = parser.parse_args()
 
@@ -957,7 +975,7 @@ if __name__ == "__main__":
         ddb.dumpdir(args.basedir)
     elif args.subcommand=='isincluded':
         ddb=DDB(args.dbfile)
-        ddb.isincluded(args.dirA, args.dirB, args.otherdb, basedir=args.mountpoint)
+        ddb.isincluded(args.dirA, args.dirB, args.otherdb, basedir=args.mountpoint, displaytrue=args.displaytrue)
     elif args.subcommand=='diff':
         ddb=DDB(args.dbfile)
         ddb.diff(args.dirA, args.dirB)
@@ -993,3 +1011,6 @@ if __name__ == "__main__":
     elif args.subcommand=='showdups':
         ddb=DDB(args.dbfile)
         ddb.showdups(basedir=args.mountpoint, nres=args.limit)
+    elif args.subcommand=='inodes':
+        ddb=DDB(args.dbfile)
+        ddb.show_same_inode(basedir=args.mountpoint, nres=args.limit)
