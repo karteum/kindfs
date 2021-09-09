@@ -73,7 +73,7 @@ def xxhash_file(filename, filesize=None, chunksize=FILE_HASH_CHUNKSIZE, inclsize
             data = fh.read(CHUNKSIZE)
             notallzeros = notallzeros | any(data)
             digest.update(data)
-    if notallzeros:
+    if not  notallzeros:
         return 0
     return digest.intdigest() - (1<<63) # return integer rather than hexdigest because it is more efficient. "- (1<<63)" is there because SQLite3 unfortunately only supports signed 64 bits integers and doesn't support unsigned
 
@@ -164,6 +164,7 @@ class DDB():
                 magictype integer,
                 nsubdirs integer,
                 nsubfiles integer,
+                nsubfiles_rec integer,
                 symtarget text,
                 st_mtime integer, st_mode integer, st_uid integer, st_gid integer, st_ino integer, st_nlink integer, st_dev integer,
                 dbsession integer not null
@@ -215,6 +216,7 @@ class DDB():
         ''') # PRAGMA main.journal_mode=WAL;
 
     def magicid(self, path, dofull=True, domime=True):
+        """Compute 'magic' filetype from libmagic, insert it in DB (if not already there) and return the ID of that entry"""
         if self.domagic==False or (dofull==False and domime==False):
             return 0
         magictype = re.sub(', BuildID\[sha1\]=[0-9a-f]*','',magic.from_file(path)) if dofull else None
@@ -242,7 +244,7 @@ class DDB():
         mytime2=time.time()
         if sync or mytime2-self.timer_insert>DB_COMMIT_PERIODICITY:
             self.sync_db()
-            self.timer_insert=mytime2
+            self.timer_insert=time.time() # Not 'mytime2' since sync_db() itself might take a few seconds, maybe more than DB_COMMIT_PERIODICITY
             #self.cur.execute(f'insert or replace into {table} values ({",".join("?" for k in vec)})', vec) #q = '(' + '?,' * (len(vec)-1) + '?)'
 
     def dirscan(self, bdir, init_path=None, parentdir=None, dirstat=None, dirlevel=0):
@@ -288,6 +290,7 @@ class DDB():
         dircontents = array.array('q') # Array of hashes for the contents of current dir. array('q') is more space-efficient than linked list, and better than numpy in this phase as it can easily grow without destroying/recreating the array
         dir_numfiles = 0
         dir_numdirs = 0
+        dir_nsubfiles_rec = 0
         for entry in os.scandir(bdir):
             path,path_printable = mydecode_path(entry.path)
             name,name_printable = mydecode_path(entry.name)
@@ -295,10 +298,11 @@ class DDB():
             if not os.path.exists(path) or not os.access(path, os.R_OK):
                 continue
             if entry.is_dir(follow_symlinks=False):
-                entrysize,dxxh = self.dirscan(entry.path,init_path=init_path,parentdir=dir_printable,dirstat=entry.stat(follow_symlinks=False),dirlevel=dirlevel+1)
+                entrysize,dxxh,nsr = self.dirscan(entry.path,init_path=init_path,parentdir=dir_printable,dirstat=entry.stat(follow_symlinks=False),dirlevel=dirlevel+1)
                 # Insertion in DB is below at dir toplevel (and this is a recursive call)
                 dircontents.append(dxxh)
                 dir_numdirs+=1
+                dir_nsubfiles_rec += nsr
             elif entry.is_symlink():
                 ltarget = os.readlink(path)
                 lxxh = xxhash.xxh64(name + ' -> ' + ltarget).intdigest() - (1<<63)
@@ -310,13 +314,14 @@ class DDB():
                     curdir_len,                         # parentdir_len
                     None,                               # size
                     lxxh,                               # hash
-                    None, None, None,                   # magictype, nsubdirs, nsubfiles
+                    None, None, None, None,             # magictype, nsubdirs, nsubfiles, nsubfiles_rec
                     ltarget,                            # symtarget
                     None,None,None,None,None,None,None, # struct stat is not needed
                     self.param_id                       # dbsession
                 ))
                 entrysize=0
                 #dir_numfiles += 1 # FIXME: should we do it ?
+                #dir_nsubfiles_rec += 1
             elif entry.is_file(follow_symlinks=False): # regular file. FIXME: sort by inode (like in https://github.com/pixelb/fslint/blob/master/fslint/findup) in order to speed up scanning ?
                 filestat = entry.stat(follow_symlinks=False)
                 entrysize = int(filestat.st_size)
@@ -330,7 +335,7 @@ class DDB():
                     entrysize,                        # size
                     fxxh,                             # hash
                     mymagicid,                        # magictype
-                    None, None, None,                 # nsubdirs, nsubfiles, symtarget
+                    None, None, None, None,           # nsubdirs, nsubfiles, nsubfiles_rec, symtarget
                     int(filestat.st_mtime), filestat.st_mode, filestat.st_uid, filestat.st_gid, filestat.st_ino, filestat.st_nlink, filestat.st_dev,
                     self.param_id                     # dbsession
                 ))
@@ -338,6 +343,7 @@ class DDB():
                 self.processedfiles+=1
                 self.processedsize+=entrysize
                 dir_numfiles += 1
+                dir_nsubfiles_rec += 1
             else:
                 continue # e.g. named pipes...
                 #print("__error__: " + path)
@@ -361,11 +367,12 @@ class DDB():
             None,                             # magictype
             dir_numdirs,                      # nsubdirs
             dir_numfiles,                     # nsubfiles
+            dir_nsubfiles_rec,                # nsubfiles_rec
             None,                             # symtarget
             int(dirstat.st_mtime), dirstat.st_mode, dirstat.st_uid, dirstat.st_gid, None ,dirstat.st_nlink, dirstat.st_dev,
             self.param_id                     # dbsession
         ))
-        return dirsize,dxxh
+        return dirsize,dxxh,dir_nsubfiles_rec
 
     def walkupdate(self, init_path="/mnt/raid"):
         def fspath(dbpath):
@@ -385,7 +392,7 @@ class DDB():
                 print(f"Deleting {file} from DB")
                 cur2.execute("delete from entries where path=?", (fsfile,))
 
-    def compute_duptable(self):
+    def compute_cachedups(self):
         cur = self.conn.cursor()
         print("Computing duplicates...")
         cur.executescript('''
@@ -400,11 +407,12 @@ class DDB():
         # select size,ndups,path,type,hash from cachedups where not parentdir in (select path from cachedups) order by size desc
 
     def showdups(self,basedir="",nres=None):
+        """Main function to display the duplicate entries (file or dirs) sorted by decreasing size"""
         cur = self.conn.cursor()
         cur2 = self.conn.cursor()
         tables = [k[0] for k in self.cur.execute("select name from sqlite_master where type='table'").fetchall()]
         if not 'cachedups' in tables:
-            self.compute_duptable()
+            self.compute_cachedups()
         limit_nres = f'limit {int(nres)}' if nres else ''
         rs = cur.execute(f"select type,path,size,hash,ndups,parentdir from cachedups order by size desc {limit_nres}") #where not parentdir in (select path from cachedups)
         for ftype,path,size,hash,ndups,parentdir in rs:
@@ -417,11 +425,10 @@ class DDB():
             elif 'syncthing' in path_real or 'lost+found' in path_real:
                 path_real = colored(path_real, 'cyan')
 
-            #if not 'syncthing' in path_real and not 'lost+found' in path_real:
             print(colored(f"{ftype} 0x{hash+(1<<63):0>16x}, {ndups} * {size>>20} Mo : ", 'yellow') + path_real)
-            #print(colored(f"{ftype} {hash}, {ndups} * {size>>20} Mo : ", 'yellow') + path_real)
 
     def show_same_inode(self,basedir="",nres=None):
+        """Same as showdups() but only return entries with identical inodes"""
         cur = self.conn.cursor()
         cur2 = self.conn.cursor()
         limit_nres = f'limit {int(nres)}' if nres else ''
@@ -493,6 +500,7 @@ class DDB():
                 print('\t'+'\n\t'.join(paths))
 
     def walk(self,init_path=''):
+        """Same function as os.walk() for filesystems"""
         cur = self.conn.cursor()
         cur2 = self.conn.cursor()
         for res in cur.execute('select path from dirs where path like ? order by path',(init_path+'/%',)):
@@ -502,129 +510,8 @@ class DDB():
             #files.append([k[0] for k in cur2.execute('select name from symlinks where parentdir=?',(dir,))])
             yield dir,dirs,files
 
-    def getincluded(self,basedir="/mnt/raid", init_path="/mnt/raid", wherepathlike='/%', resetdb=False):
-        cur = self.conn.cursor()
-        print("Computing duplicates...")
-        if resetdb:
-            cur.executescript(f'''
-                drop table if exists tmp;
-                create table tmp(parentdir text, path text, xxh64be integer, size integer, dups integer, atype integer);
-                insert into tmp select parentdir,path,xxh64be,size,foo.dups,0 from dirs inner join (select count(*) as dups, xxh64be as xxh from dirs group by xxh64be having count(*)>1) foo on dirs.xxh64be=xxh where path like '{wherepathlike}';
-                insert into tmp select parentdir,path,xxh64be,size,foo.dups,1 from files inner join (select count(*) as dups, xxh64be as xxh from files group by xxh64be having count(*)>1) foo on files.xxh64be=xxh where path like '{wherepathlike}';
-                create index tmp_parentdir_idx on tmp(parentdir);
-                create index tmp_path_idx on tmp(path);
-                create index tmp_xxh64be_idx on tmp(xxh64be);
-                create index tmp_size_idx on tmp(size);
-            ''')
-        cur.executescript('''
-                drop table if exists tmp2;
-                create temp table tmp2 (path text, size integer,ndupdirs integer,nsubdirs integer,ndupfiles integer, nsubfiles integer);
-                create index tmp2_path_idx on tmp2(path);
-                create index tmp2_size_idx on tmp2(size);
-        ''')
-        print("Finished first part")
-        cur2 = self.conn.cursor()
-        c=cur.execute('select count(*) from dirs where path like ? order by path',(basedir[len(init_path):]+'/%',)).fetchone()[0]
-        k=0
-        for dir,nsubdirs,nsubfiles,size in cur.execute('select path,nsubdirs,nsubfiles,size from dirs where path like ? order by path',(basedir[len(init_path):]+'/%',)):
-            ndupdirs=cur2.execute('select count(*) from tmp where parentdir=? and atype=0',(dir,)).fetchone()[0]
-            ndupfiles=cur2.execute('select count(*) from tmp where parentdir=? and atype=1',(dir,)).fetchone()[0]
-            if ndupdirs>0.8*nsubdirs or ndupfiles>0.8*nsubfiles:
-                sizedupd=0
-                for line in cur2.execute('select * from tmp where atype=1 and parentdir=? or parentdir in (select path from dirs where parentdir=?)',(dir,dir)): # FIXME: does not include the size of subdirs / incorrect size
-                    parentdir, path, xxh64be, asize, dups, atype = line
-                    if not basedir in path:
-                        sizedupd+=asize
-                #print((dir,size,ndupdirs,nsubdirs,ndupfiles,nsubfiles))
-                cur2.execute('insert into tmp2 values (?,?,?,?,?,?)', (dir,sizedupd>>20,ndupdirs,nsubdirs,ndupfiles,nsubfiles))
-            k+=1
-            sys.stderr.write("\033[2K\rScanning: [%d / %d]" % (k,c)) ; sys.stderr.flush()
-        print()
-        for line in cur.execute("select * from tmp2 order by size desc limit 30"):
-            print(line)
-
-
-    def getincluded2(self,basedir="/mnt/raid", init_path="/mnt/raid",wherepathlike='/%'):
-        cur = self.conn.cursor()
-        print("Computing duplicates...")
-        cur.executescript(f'''
-            drop table if exists tmp;
-            create temp table tmp(parentdir text, path text, xxh64be integer, size integer, dups integer, atype integer);
-            insert into tmp select parentdir,path,xxh64be,size,foo.dups,0 from dirs inner join (select count(*) as dups, xxh64be as xxh from dirs group by xxh64be having count(*)>1) foo on dirs.xxh64be=xxh where path like '{wherepathlike}';
-            insert into tmp select parentdir,path,xxh64be,size,foo.dups,1 from files inner join (select count(*) as dups, xxh64be as xxh from files group by xxh64be having count(*)>1) foo on files.xxh64be=xxh where path like '{wherepathlike}';
-            create index tmp_parentdir_idx on tmp(parentdir);
-            create index tmp_path_idx on tmp(path);
-            create index tmp_xxh64be_idx on tmp(xxh64be);
-            create index tmp_size_idx on tmp(size);
-
-            drop table if exists tmp2;
-            create temp table tmp2(path text, size integer, atype integer);
-            create index tmp2_path_idx on tmp2(path);
-            create index tmp2_size_idx on tmp2(size);
-        ''')
-        print("Finished SQL part")
-        res={}
-        k=0
-        for (_dir, dirs, files) in os.walk(bytes(basedir, encoding='utf-8'), topdown=False):
-            dir,dir_printable = mydecode_path(_dir)
-            res_cur=[0,0,0,0,0,0]
-            for _file in files:
-                res_cur[0] += 1
-                file,file_printable = mydecode_path(_file)
-                if file=='.DS_Store' or file=='._.DS_Store':
-                    continue
-                path = dir + "/" + file
-                path_printable = dir_printable + "/" + file_printable
-                alreadythere = cur.execute("select size from tmp where path=? and atype=1", (path_printable[len(init_path):],)).fetchall()
-                if len(alreadythere)>0:
-                    res_cur[1] += 1
-                    res_cur[4] = alreadythere[0][0]
-                    cur.execute('insert into tmp2 values(?,?,1)', (path_printable[len(init_path):],alreadythere[0][0]))
-            for _mydir in dirs:
-                res_cur[2]+=1
-                mydir,mydir_printable = mydecode_path(_mydir)
-                mypath=dir+'/'+mydir
-                mypath_printable=dir_printable+'/'+mydir_printable
-                alreadythere = cur.execute("select size from tmp where path=? and atype=0", (mypath_printable[len(init_path):],)).fetchall()
-                if len(alreadythere)>0:
-                    res_cur[3] += 1
-                    res_cur[5] = alreadythere[0][0]
-                    cur.execute('insert into tmp2 values(?,?,0)', (mypath_printable[len(init_path):],alreadythere[0][0]))
-            if (res_cur[1]>0.8*res_cur[0]) or (res_cur[3]>0.8*res_cur[2]):
-                res[dir]=res_cur
-            k+=1
-            sys.stderr.write("\033[2K\rScanning: [%d dirs] %s " % (k,dir)) ; sys.stderr.flush()
-        for k,v in res.items():
-            print(f'{k} : {v}')
-        rs=cur.execute('select * from tmp2 order by size desc limit 30')
-        for k in rs:
-            print(k)
-        return res
-
-    def detectsubdups(self, dir1,dir2):
-        cur1 = self.conn.cursor()
-        cur2 = self.conn.cursor()
-        rs1 = cur1.execute("select parentdir,name,xxh64be,size from dirs where parentdir like ? order by parentdir,name", (dir1+'%',))
-        rs2 = cur2.execute("select parentdir,name,xxh64be,size from dirs where parentdir like ? order by parentdir,name", (dir2+'%',))
-        while True:
-            line1=rs1.fetchone()
-            line2=rs2.fetchone()
-            if(line1==None or line2==None):
-                if line1!=None:
-                    print("Line1 still has values + %s" % (str(rs1.fetchone())))
-                if line2!=None:
-                    print("Line2 still has values")
-                break
-            (parentdir1,name1,xxh64be1,size1) = line1
-            (parentdir2,name2,xxh64be2,size2) = line2
-            pdir1=parentdir1.replace(dir1,'')+'/'+name1
-            pdir2=parentdir2.replace(dir2,'')+'/'+name2
-            foo1=("(%d, 0x%016x)" % (size1, xxh64be1+(1<<63)))
-            foo2=("(%d, 0x%016x)" % (size2, xxh64be2+(1<<63)))
-            if(foo1!=foo2 and pdir1==pdir2):
-                print(foo1 + ' | ' + foo2 + ' -> ' + pdir1)
-
     def dumpdir(self, adir=''):
+        """Dumps the contents of a dir (and all subdirs) with hash and size"""
         cur = self.conn.cursor()
         for line in cur.execute("select path,xxh64be,size from dirs where path like ? order by path", (adir+'/%',)):
             (path,xxh64be,size) = line
@@ -667,16 +554,16 @@ class DDB():
                 #rs2=cur2.execute("select path from files where xxh64be=? and size=? and path!=?", (xxh, size, path)).fetchall()
 
             if not rs2:
-                print(colored(f"\033[2K\rNo equivalent for {xxh+(1<<63):0>16x}, {size>>20} Mo : {self.dbname}:{path}",'yellow'))
+                print(colored(f"No equivalent for {xxh+(1<<63):0>16x}, {size>>20} Mo : {self.dbname}:{path}",'yellow'))
             else:
                 # Even if there are results, we should check whether they still exist (when checkfs==True) in case they might have been deleted since previous scan
                 # FIXME: we restrict to the 20 first dups as otherwise there is a performance issue for rare cases with large number of results (e.g. small system/compilation files that are identical among many projects). But this workaround is suboptimal.
                 is_dup_real=True if checkfs==False else any([os.path.exists(basedir+dup[0]) for dup in rs2[:20]])
                 if not is_dup_real:
-                    print(colored(f"\033[2K\rNo equivalent anymore for ({size>>20} Mo) : {path}",'red'))
+                    print(colored(f"No equivalent anymore for ({size>>20} Mo) : {path}",'red'))
                     res.append(path)
                 elif displaytrue:
-                    print(colored(f"\033[2K\r{path} ({size>>20} Mo) has the equivalent: {rs2}",'green'))
+                    print(colored(f"{path} ({size>>20} Mo) has the equivalents: {rs2}",'green'))
             mytime2=time.time()
             if mytime2-self.timer_print>0.05:
                 sys.stderr.write(f"\033[2K\rScanning: [{k} / {mycount} entries, {int(100*k/mycount)}%] ")
@@ -691,27 +578,36 @@ class DDB():
         self.isincluded(dir1,dir2)
         self.isincluded(dir2,dir1)
 
-    def diffrec(self,dir1,dir2):
+    def getincluded(self,basedir=''):
+        def make_nsubfiles_rec(adir):
+            cur_tmp = self.conn.cursor()
+            #return cur_tmp.execute("select count(*) from entries where path like ? and type='F'", (dir+'/%',)).fetchall()[0][0]
+            #rs1=cur_tmp.execute("select sum(nsubfiles) ns from entries where path like ? and type='D'", (adir+'/%',)).fetchall()[0][0]
+            rs2=cur_tmp.execute("select nsubfiles from entries where path=? and type='D'", (adir,)).fetchall()[0][0]
+            rs1=None
+            rs1 = rs1 if rs1!=None else 0
+            print((rs1,rs2,adir))
+            return rs1+rs2
+
         cur = self.conn.cursor()
         cur2 = self.conn.cursor()
-        files = cur.execute("select name,xxh64be,size,path from files where size>0 and parentdir=? order by path", (dir1,))
-        for line in files:
-            name,xxh,size,path=line
-            rs2=cur2.execute("select path from files where xxh64be=? and size=? and parent=?", (xxh, size, dir2)).fetchall()
-            if len(rs2)==0:
-                print("%s has no equivalent" % (path))
-
-        dirs = cur.execute("select name,xxh64be,size,path from dirs where size>0 and parentdir=? order by path", (dir1,))
-        for line in files:
-            name,xxh,size,path=line
-            rs2=cur2.execute("select path from files where xxh64be=? and size=? and parent=?", (xxh, size, dir2)).fetchall()
-            if len(rs2)==0:
-                print("%s has no equivalent" % (path))
+        #rs = cur.execute("select path,nsubfiles_rec from entries where type='D'")
+        rs = cur.execute("select path,size from entries where type='D' and path like ?", (basedir+'/%',))
+        for parentdir,size in rs:
+            nsubfiles_rec = make_nsubfiles_rec(parentdir)
+            continue
+            dir_isdup = cur2.execute("select count(*) from cachedups where path=?", (parentdir,)).fetchall()[0][0]
+            if dir_isdup:
+                print(parentdir)
+            nsubfiles_rec_dups = cur2.execute("select count(*) from cachedups where type='F' and path like ?", (parentdir+'/%',)).fetchall()[0][0]
+            if nsubfiles_rec_dups==nsubfiles_rec:
+                print(parentdir)
 
     def migrate(self):
+        """Migrate from old to new DB schema (table 'entries' instead of tables 'files', 'dirs' and 'symlinks')"""
         tables = [k[0] for k in self.cur.execute("select name from sqlite_master where type='table'").fetchall()]
         if 'files' in tables and 'dirs' in tables and not 'entries' in tables:
-            print("Migrating DB")
+            print("Migrating DB")  # FIXME: nsbubfiles_rec is not processed yet
             self.cur.executescript('''
                 drop table if exists entries;
                 create table entries(
@@ -726,6 +622,7 @@ class DDB():
                     magictype integer,
                     nsubdirs integer,
                     nsubfiles integer,
+                    nsubfiles_rec integer,
                     symtarget text,
                     st_mtime integer, st_mode integer, st_uid integer, st_gid integer, st_ino integer, st_nlink integer, st_dev integer,
                     dbsession integer not null
@@ -936,7 +833,7 @@ if __name__ == "__main__":
     subparsers.add_parser('computehash', help="Compute hash")
     subparsers.add_parser('check_zerofile', help="Check whether file is made only of zeros (e.g. corrupted)")
 
-    subparsers.add_parser('compute_duptable', help="Compute duptable")
+    subparsers.add_parser('compute_cachedups', help="Compute cachedups")
     parser_dupdirs = subparsers.add_parser('showdups', help="show duplicates")
     parser_dupdirs.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default='')
     parser_dupdirs.add_argument("--limit", "-l", help="Max number of results", default=None)
@@ -951,6 +848,9 @@ if __name__ == "__main__":
     parser_inodes = subparsers.add_parser('inodes', help="show duplicate dirs")
     parser_inodes.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default=None)
     parser_inodes.add_argument("--limit", "-l", help="Max number of results", default=None)
+
+    parser_getincluded = subparsers.add_parser('getincluded', help="test")
+    parser_getincluded.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default='')
 
     args = parser.parse_args()
 
@@ -1002,15 +902,18 @@ if __name__ == "__main__":
         filestat = os.stat(args.dbfile)
         entrysize = int(filestat.st_size)
         fxxh = xxhash_file(args.dbfile, entrysize)
-        print(f"0x{fxxh+(1<<63):0>16x}, {entrysize>>20} Mo : {args.dbfile}")
+        print(f"0x{fxxh+(1<<63):0>16x}, {fxxh+(1<<63)} {fxxh}, {entrysize>>20} Mo : {args.dbfile}")
     elif args.subcommand=='check_zerofile':
         check_zerofile(args.dbfile)
-    elif args.subcommand=='compute_duptable':
+    elif args.subcommand=='compute_cachedups':
         ddb=DDB(args.dbfile)
-        ddb.compute_duptable()
+        ddb.compute_cachedups()
     elif args.subcommand=='showdups':
         ddb=DDB(args.dbfile)
         ddb.showdups(basedir=args.mountpoint, nres=args.limit)
     elif args.subcommand=='inodes':
         ddb=DDB(args.dbfile)
         ddb.show_same_inode(basedir=args.mountpoint, nres=args.limit)
+    elif args.subcommand=='getincluded':
+        ddb=DDB(args.dbfile)
+        ddb.getincluded(basedir=args.mountpoint)
