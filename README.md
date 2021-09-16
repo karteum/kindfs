@@ -3,11 +3,11 @@ Index FS into a database, then easily make queries e.g. to find duplicates files
 
 At the moment, the only DB supported is SQLite3.
 
-Files are scanned with their metadata (e.g. file permissions, size, etc), filetype (from libmagic), and hashed contents (from xxhash). A pseudo-hash is then generated for dirs based on the dir contents (hashes from subfiles and pseudo-hash from subdirs). It is assumed that two files or dirs are "likely identical" when they have the same size and same hash. WARNING : since scanning speed was important to me, the hash is only made on the first/middle/last 1 MB of a file i.e. two files of identical size and different contents may exhibit the same hash (this is why (among other things) you should always double-check when this program identifies and returns candidate duplicate files/dirs).
+Files are scanned with their metadata (e.g. file permissions, size, etc), filetype (from libmagic), and hashed contents (from xxhash). A pseudo-hash is then generated for dirs based on the dir contents (hashes from subfiles and pseudo-hash from subdirs). Indexing should properly support (and not fail) when a part of the filesystem uses a different encoding (e.g. an old backup)
 
-Indexing should properly support (and not fail) when a part of the filesystem uses a different encoding (e.g. an old backup)
+It is assumed that two files or dirs are "likely identical" when they have the same size and same hash (see "DISCLAIMER" text below !).
 
-This program is in early phase and still not finished. Expect bugs ! The DB schema is simple but not optimal (and certainly not 3NF), and some informations are duplicate (e.g. 'parentdir/name' is equivalent to 'path', but all 3 fields were convenient for performance with sqlite indexes and FUSE)
+When two dirs are identical, quite often their parent dirs are "almost identical", so it is useful to check whether all files from one side might have a corresponding duplicate on the other side. Or more generally you may wish to progressively sort your data into a `clean/` folder, and check some other dirs (let's call it `mess/`) to know (regardless of the subfiles/subdirs structure) which subfiles/subdirs are already present in `clean/` and which are not. The command `isincluded` helps for that purpose.
 
 ## Usage
 For the moment, this app is only tested on Linux (although it should work also work on BSD and other UNIX systems such as MacOS as long as you have FUSE). A prerequisite is to have the following packages installed : `pip install xxhash numpy fusepy python-magic`
@@ -29,3 +29,5 @@ Then the CLI has the following options : `kindfs <dbfile> <command> [args]`
 
 ## DISCLAIMER
 You should read and understand the GPLv3 license (including their sections "Disclaimer of Warranty" and "Limitation of Liability"). In particular : although this tool can help detecting duplicate files, it may contain bugs, return wrong informations, behave in unintended ways. Use this software at your own risk, and it is adviced to double-check the results and never delete files/dirs unless you are sure of what you are doing !
+
+_In particular : like all hash algorithms, xxhash() may lead to collisions i.e. same hash for different data, even though probability is assumed to be low. However in addition to that and since scanning speed was also considered an important feature, the default behavior is to compute the hash only from the first/middle/last 1 MB of a file i.e. two different files of identical size may exhibit the same hash when they are identical on those 3x1MB segments (this should rarely happen for most file types, but one counter-example is VM files where this can frequently happen). This is why (among other things) you should always double-check when this program identifies and returns candidate duplicate files/dirs._
