@@ -5,7 +5,6 @@
 # Prerequisite : pip install xxhash numpy fusepy python-magic
 # Beware : this software only hashes portions of files for speed (and therefore may consider that some files/dirs are identical when they are not really). Use this program at your own risk and only when you know what you are doing ! (and double-check with filenames + if unsure, triple-check with full md5sum or diff -r !)
 
-
 # Parameters
 DB_COMMIT_PERIODICITY=5  # flush/commit DB every x seconds. Higher values implies more RAM usage but higher I/O performance
 DISPLAY_PERIODICITY=0.1
@@ -73,7 +72,7 @@ def xxhash_file(filename, filesize=None, chunksize=FILE_HASH_CHUNKSIZE, inclsize
             data = fh.read(CHUNKSIZE)
             notallzeros = notallzeros | any(data)
             digest.update(data)
-    if not  notallzeros:
+    if not notallzeros and (filesize<=3*CHUNKSIZE or check_zerofile(filename)):
         return 0
     return digest.intdigest() - (1<<63) # return integer rather than hexdigest because it is more efficient. "- (1<<63)" is there because SQLite3 unfortunately only supports signed 64 bits integers and doesn't support unsigned
 
@@ -101,11 +100,31 @@ def mydecode_path(pathbytes,fixparts=False):
         path_printable = pathbytes.decode('utf-8',errors="replace")
     return pathbytes.decode('utf-8',errors="surrogateescape"), path_printable
 
+def regmulti(regfile):
+    regstr = ""
+    with open(regfile) as fh:
+        for reg in fh:
+            reg=reg.replace("\n","")
+            regstr += f'(?:{reg})|'
+    regex = re.compile(regstr[:-1]) # FIXME: max length ?
+    print(regex)
+    return regex
+
+def globmulti(globfile,var='path'):
+    """Generate the 'where' part of an SQL query excluding all the entries in globfile"""
+    globarr = []
+    with open(globfile) as fh:
+        for g in fh:
+            g=g.replace("\n","")
+            globarr.append(f"not {var} glob '{g}'")
+    globstr = "(" + " and ".join(globarr) + ")"
+    return globstr
+
 ######################################################
 # DB class
 
 class DDB():
-    def __init__(self, dbname, domagic=False, rw=False):
+    def __init__(self, dbname, domagic=False, rw=False, regignore=None, globignore=None):
         self.dbname=dbname
         self.conn = sqlite3.connect(dbname)
         self.conn.create_function("get_parentdir_len", 1, lambda x: 0 if os.path.dirname(x)=='/' else len(os.path.dirname(x)))
@@ -132,7 +151,8 @@ class DDB():
                 print('No existing tables')
                 self.createdb()
         else:
-            self.conn.execute("PRAGMA temp_store = MEMORY") # "pragma query_only = ON" does not enable temp views...
+            pass
+            #self.conn.execute("PRAGMA temp_store = MEMORY") # "pragma query_only = ON" does not enable temp views...
         #self.init_path=init_path.rstrip('/')
         self.magictypes = {}
         self.domagic=domagic
@@ -144,6 +164,10 @@ class DDB():
             for line in self.cur.execute('select id,magictype from magictypes'):
                 magicid,magictype = line
                 self.magictypes[magictype] = magicid
+
+        self.regex = regmulti(regignore) if regignore else None
+        self.globignore= globmulti(globignore) if globignore else ''
+        print(self.globignore)
 
     def createdb(self):
         print("Creating / resetting DB")
@@ -392,40 +416,84 @@ class DDB():
                 print(f"Deleting {file} from DB")
                 cur2.execute("delete from entries where path=?", (fsfile,))
 
-    def compute_cachedups(self):
+    def compute_cachedups(self,basedir=""):
         cur = self.conn.cursor()
+        cur2 = self.conn.cursor()
+        cur3 = self.conn.cursor()
         print("Computing duplicates...")
-        cur.executescript('''
-            drop table if exists cachedups;
-            create table cachedups (parentdir_len text, path text, type integer, hash integer, size integer, ndups integer, parentdir text GENERATED ALWAYS AS (substr(path,1,parentdir_len)) VIRTUAL);
-            create index cachedups_path_idx on cachedups(path);
-            create index cachedups_hash_idx on cachedups(hash);
-            create index cachedups_size_idx on cachedups(size);
+        wbasedir = f"where path like '{basedir}/%'" if basedir!='' else ''
+        wbasedir2 = f"and path like '{basedir}/%'" if basedir!='' else ''
+        cur.executescript(f'''
+            drop table if exists cachedups_h;
+            create table cachedups_h (hash integer, size integer, ndups integer,type char(1));
+            insert into cachedups_h select hash,size,count(*),type from entries {wbasedir} group by hash,size,type having count(*)>1;
 
-            insert into cachedups select parentdir_len,path,type,entries.hash,entries.size,ndups from entries inner join (select count(*) as ndups, hash, size from entries group by hash,size,type having count(*)>1) foo on entries.hash=foo.hash where entries.size=foo.size order by entries.size desc;
+            drop table if exists cachedups;
+            create table cachedups (entry_id integer not null, size, ndups integer);
+            create index cachedups_entry_id_idx on cachedups(entry_id);
+            create index cachedups_size_idx on cachedups(size);
+            insert into cachedups select entries.id,entries.size,ndups from entries inner join cachedups_h
+                on entries.hash=cachedups_h.hash where entries.size=cachedups_h.size {wbasedir2} and entries.type=cachedups_h.type
+                order by entries.size desc;
+
+            drop table if exists cachedups_d;
+            create table cachedups_d (entry_id integer not null, size integer, nsubdups integer);
+            create index cachedups_d_entry_id_idx on cachedups_d(entry_id);
+            create index cachedups_d_size_idx on cachedups_d(size);
         ''')
+
+        print("Phase 2")
+        cachedups_d = defaultdict(int)
+        n=0 ; ncount = cur.execute("select count(*) from cachedups_h where type='F'").fetchall()[0][0]
+        rs = cur.execute("select hash,ndups from cachedups_h where type='F'")
+        for hash,ndups in rs:
+            if(ndups>1000 or hash==0):
+                continue
+            n+=1
+            paths=[k[0] for k in cur2.execute("select path from entries where type='F' and hash=?",(hash,)).fetchall()]
+            for path in paths:
+                dir_tmp = os.path.dirname(path)
+                #pdir_isdup = cur3.execute("select count(*) from cachedups inner join entries on entry_id=entries.id where path=?", (dir_tmp,)).fetchall()[0][0]
+                while dir_tmp!='/':
+                    if any([not dir_tmp in k for k in paths]):
+                        cachedups_d[dir_tmp] += 1
+                        dir_tmp = os.path.dirname(dir_tmp)
+                    else: break
+                #sys.stderr.write(f".");sys.stderr.flush()
+            sys.stderr.write(f"\033[2K\r{int(100*n/ncount)}%");sys.stderr.flush()
+        #rs = cur.execute("select path,hash from cachedups inner join entries on entry_id=entries.id where type='F'")
+        #for path,hash in rs:
+            #path_tmp = os.path.dirname(path)
+            #while path_tmp!='/':
+                #cachedirs_dupratio[path_tmp] += 1
+                #path_tmp = os.path.dirname(path_tmp)
+        print("Phase 3")
+        cur.executemany("insert into cachedups_d select id,size,? from entries where path=?", [(v,k) for k,v in cachedups_d.items()])
+        self.conn.commit()
         # select size,ndups,path,type,hash from cachedups where not parentdir in (select path from cachedups) order by size desc
 
-    def showdups(self,basedir="",nres=None):
+    def showdups(self,basedir="",mountpoint="",nres=None,orderbysize=True):
         """Main function to display the duplicate entries (file or dirs) sorted by decreasing size"""
+        orderby = "cachedups.size" if orderbysize else "nsubfiles_rec"
         cur = self.conn.cursor()
         cur2 = self.conn.cursor()
         tables = [k[0] for k in self.cur.execute("select name from sqlite_master where type='table'").fetchall()]
         if not 'cachedups' in tables:
             self.compute_cachedups()
+        wbasedir = f"where path like '{basedir}/%'" if basedir!='' else "" #"where type='D'"
         limit_nres = f'limit {int(nres)}' if nres else ''
-        rs = cur.execute(f"select type,path,size,hash,ndups,parentdir from cachedups order by size desc {limit_nres}") #where not parentdir in (select path from cachedups)
-        for ftype,path,size,hash,ndups,parentdir in rs:
-            pdir_isdup = cur2.execute("select count(*) from cachedups where path=?", (parentdir,)).fetchall()[0][0]
-            path_real = basedir+path
-            if basedir!='' and basedir!=None and not os.path.exists(basedir+path):
+        rs = cur.execute(f"select type,path,cachedups.size,hash,ndups,parentdir,nsubfiles_rec from cachedups inner join entries on entry_id=entries.id {wbasedir} order by {orderby} desc {limit_nres}") #where not parentdir in (select path from cachedups)
+        for ftype,path,size,hash,ndups,parentdir,nsubfiles_rec in rs:
+            pdir_isdup = cur2.execute("select count(*) from cachedups inner join entries on entry_id=entries.id where path=?", (parentdir,)).fetchall()[0][0]
+            path_real = mountpoint+path
+            if mountpoint!='' and mountpoint!=None and not os.path.exists(mountpoint+path):
                 path_real = colored(path_real, 'red')
             elif pdir_isdup>0:
                 path_real = colored(path_real, 'cyan') + colored(' [parent dir already in dups]', 'yellow')
             elif 'syncthing' in path_real or 'lost+found' in path_real:
                 path_real = colored(path_real, 'cyan')
 
-            print(colored(f"{ftype} 0x{hash+(1<<63):0>16x}, {ndups} * {size>>20} Mo : ", 'yellow') + path_real)
+            print(colored(f"{ftype} 0x{hash+(1<<63):0>16x}, {ndups} * {size>>20} Mo | {nsubfiles_rec} files : ", 'yellow') + path_real)
 
     def show_same_inode(self,basedir="",nres=None):
         """Same as showdups() but only return entries with identical inodes"""
@@ -521,7 +589,7 @@ class DDB():
         cur = self.conn.cursor()
         return cur.execute("select sum(size) from files").fetchall()[0][0]
 
-    def isincluded(self, path_test, path_ref, otherddbfs=None, excluded="",docount=True,displaytrue=False,basedir="", checkfs=True):
+    def isincluded(self, path_test, path_ref, otherddbfs=None, docount=True,display_included=False,display_notincluded=True,basedir="", checkfs=True, raw=False):
         """Checks whether every file under path_test/ (and subdirs) has a copy somewhere in path_ref (regardless of the directory structure in path_ref/ )"""
         cur = self.conn.cursor()
         if otherddbfs:
@@ -530,19 +598,21 @@ class DDB():
         else:
             cur2 = self.conn.cursor()
 
-        mycount=cur.execute("select count(*) from (select path from files where size>0 and path like ? order by id)", (path_test+"/%",)).fetchone()[0] if docount else 1
-        rs = cur.execute("select name,xxh64be,size,path from files where size>0 and path like ? order by id", (path_test+'/%',))
+        ignorestr = f'and {self.globignore}' if self.globignore else ''
+        mycount=cur.execute(f"select count(*) from (select path from files where size>0 and path like ? order by id)", (path_test+"/%",)).fetchone()[0] if docount else 1  # FIXME: putting {ignorestr} here would make the result accurate but would significantly slow-down the query... I think it is OK if the number/progressbar is overestimated
+        rs = cur.execute(f"select name,xxh64be,size,path from files where size>0 and path like ? {ignorestr} order by id", (path_test+'/%',))
         k=1
         if not rs or mycount==0:
             print('No results !')
-        res = []
         if basedir=='':
             checkfs=False
         for line in rs:
             name,xxh,size,path=line
-            if excluded!="" and excluded in path:
+            if xxh==0 or size==0: # skip null files or files made of zeros
                 continue
             if checkfs and not os.path.exists(basedir+path):
+                if not raw:
+                    sys.stderr.write(colored(f"\033[2K\r{basedir+path} ({size>>20} Mo) is deleted\n",'red'))
                 continue
             if not otherddbfs and path_ref=='':
                 rs2=cur2.execute("select path from files where xxh64be=? and size=? and not path like ?", (xxh, size, path_test+'/%')).fetchall()
@@ -554,54 +624,54 @@ class DDB():
                 #rs2=cur2.execute("select path from files where xxh64be=? and size=? and path!=?", (xxh, size, path)).fetchall()
 
             if not rs2:
-                print(colored(f"No equivalent for {xxh+(1<<63):0>16x}, {size>>20} Mo : {self.dbname}:{path}",'yellow'))
+                if display_notincluded:
+                    if(raw): print(path)
+                    else:
+                        sys.stderr.write(f"\033[2K\r")
+                        #print(colored(f"No equivalent for {xxh+(1<<63):0>16x}, {size>>20} Mo : {self.dbname}:{path}",'yellow'))
+                        print(colored(f"No equivalent for {xxh+(1<<63)}, {size>>20} Mo : {path}",'yellow'))
             else:
-                # Even if there are results, we should check whether they still exist (when checkfs==True) in case they might have been deleted since previous scan
-                # FIXME: we restrict to the 20 first dups as otherwise there is a performance issue for rare cases with large number of results (e.g. small system/compilation files that are identical among many projects). But this workaround is suboptimal.
-                is_dup_real=True if checkfs==False else any([os.path.exists(basedir+dup[0]) for dup in rs2[:20]])
-                if not is_dup_real:
-                    print(colored(f"No equivalent anymore for ({size>>20} Mo) : {path}",'red'))
-                    res.append(path)
-                elif displaytrue:
-                    print(colored(f"{path} ({size>>20} Mo) has the equivalents: {rs2}",'green'))
-            mytime2=time.time()
-            if mytime2-self.timer_print>0.05:
-                sys.stderr.write(f"\033[2K\rScanning: [{k} / {mycount} entries, {int(100*k/mycount)}%] ")
-                sys.stderr.flush()
-                self.timer_print=mytime2
-            k+=1
+                if checkfs and not any([os.path.exists(basedir+dup[0]) for dup in rs2[:20]]):
+                    # Even if there are results, we check here whether they still exist (when checkfs==True) in case they might have been deleted since previous scan
+                    # FIXME: we restrict to the 20 first dups as otherwise there is a performance issue for rare cases with large number of results (e.g. small system/compilation files that are identical among many projects). But this workaround is suboptimal.
+                    if display_notincluded:
+                        if(raw): print(path)
+                        else:
+                            sys.stderr.write(f"\033[2K\r")
+                            print(colored(f"No equivalent anymore for ({size>>20} Mo) : {path}",'red'))
+                elif display_included:  # in that case we only display results for dirA that _are_ in dirB
+                    if(raw): print(path)
+                    else:
+                        sys.stderr.write(f"\033[2K\r")
+                        print(colored(f"{path} ({size>>20} Mo) has the equivalents: {rs2}",'green'))
+
+            if not raw:
+                mytime2=time.time()
+                if mytime2-self.timer_print>0.05:
+                    sys.stderr.write(f"\033[2K\rScanning: [{k} / {mycount} entries, {int(100*k/mycount)}%] ")
+                    sys.stderr.flush()
+                    self.timer_print=mytime2
+                k+=1
         if otherddbfs:
             conn2.close()
-        return res
 
     def diff(self,dir1,dir2):
         self.isincluded(dir1,dir2)
         self.isincluded(dir2,dir1)
 
     def getincluded(self,basedir=''):
-        def make_nsubfiles_rec(adir):
-            cur_tmp = self.conn.cursor()
-            #return cur_tmp.execute("select count(*) from entries where path like ? and type='F'", (dir+'/%',)).fetchall()[0][0]
-            #rs1=cur_tmp.execute("select sum(nsubfiles) ns from entries where path like ? and type='D'", (adir+'/%',)).fetchall()[0][0]
-            rs2=cur_tmp.execute("select nsubfiles from entries where path=? and type='D'", (adir,)).fetchall()[0][0]
-            rs1=None
-            rs1 = rs1 if rs1!=None else 0
-            print((rs1,rs2,adir))
-            return rs1+rs2
-
         cur = self.conn.cursor()
         cur2 = self.conn.cursor()
-        #rs = cur.execute("select path,nsubfiles_rec from entries where type='D'")
-        rs = cur.execute("select path,size from entries where type='D' and path like ?", (basedir+'/%',))
-        for parentdir,size in rs:
-            nsubfiles_rec = make_nsubfiles_rec(parentdir)
-            continue
+        rs = cur.execute("select path,nsubfiles_rec,size from entries where type='D' and path like ? order by size desc", (basedir+'/%',))
+        #rs = cur.execute("select path,size from entries where type='D' and path like ?", (basedir+'/%',))
+        for parentdir,nsubfiles_rec,size in rs:
+            #nsubfiles_rec = make_nsubfiles_rec(parentdir)
             dir_isdup = cur2.execute("select count(*) from cachedups where path=?", (parentdir,)).fetchall()[0][0]
             if dir_isdup:
-                print(parentdir)
+                print(f"{parentdir} is dup")
+                continue
             nsubfiles_rec_dups = cur2.execute("select count(*) from cachedups where type='F' and path like ?", (parentdir+'/%',)).fetchall()[0][0]
-            if nsubfiles_rec_dups==nsubfiles_rec:
-                print(parentdir)
+            print(f"{size>>20} MB, {100*nsubfiles_rec_dups/nsubfiles_rec:.1f}% dups : {parentdir}")
 
     def migrate(self):
         """Migrate from old to new DB schema (table 'entries' instead of tables 'files', 'dirs' and 'symlinks')"""
@@ -815,10 +885,14 @@ if __name__ == "__main__":
     parser_isincluded.add_argument('dirB', help="dest dir")
     parser_isincluded.add_argument("--otherdb", "-o", help="otherdb", default=None)
     parser_isincluded.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default='')
-    parser_isincluded.add_argument("--displaytrue", "-d", help="Display all dups", action='store_true', default=False)
+    parser_isincluded.add_argument("--display_included", "-i", help="Display files from dirA that are in dirB", action='store_true', default=False)
+    parser_isincluded.add_argument("--display_notincluded", "-n", help="Display files from dirA that are not in dirB", action='store_true', default=False)
+    #parser_isincluded.add_argument("--raw", "-r", help="Display files from dirA that are not in dirB", action='store_true', default=False)
+    parser_isincluded.add_argument("--globignore", "-z", help="Glob file to ignore results", default=None)
 
     parser_comparedb = subparsers.add_parser('comparedb', help="Compare two DB")
     parser_comparedb.add_argument('otherdb', help="DB to compare with")
+    parser_comparedb.add_argument("--globignore", "-z", help="Glob file to ignore results", default=None)
 
     parser_migrate = subparsers.add_parser('migrate', help="Migrate DB schema")
     parser_migrate.add_argument('newdb', help="New DB filename with updated schema")
@@ -836,6 +910,7 @@ if __name__ == "__main__":
     subparsers.add_parser('compute_cachedups', help="Compute cachedups")
     parser_dupdirs = subparsers.add_parser('showdups', help="show duplicates")
     parser_dupdirs.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default='')
+    parser_dupdirs.add_argument("--basedir", "-b", help="Basedir", default='')
     parser_dupdirs.add_argument("--limit", "-l", help="Max number of results", default=None)
 
     # Legacy
@@ -850,7 +925,10 @@ if __name__ == "__main__":
     parser_inodes.add_argument("--limit", "-l", help="Max number of results", default=None)
 
     parser_getincluded = subparsers.add_parser('getincluded', help="test")
-    parser_getincluded.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default='')
+    parser_getincluded.add_argument("--basedir", "-b", help="Basedir", default='')
+
+    parser_testreg = subparsers.add_parser('testreg', help="test")
+    parser_testreg.add_argument("teststring", default="")
 
     args = parser.parse_args()
 
@@ -874,8 +952,14 @@ if __name__ == "__main__":
         ddb=DDB(args.dbfile)
         ddb.dumpdir(args.basedir)
     elif args.subcommand=='isincluded':
-        ddb=DDB(args.dbfile)
-        ddb.isincluded(args.dirA, args.dirB, args.otherdb, basedir=args.mountpoint, displaytrue=args.displaytrue)
+        ddb=DDB(args.dbfile, globignore=args.globignore)
+        if not (args.display_notincluded or args.display_included):
+            print('Choose -n or -i !')
+            exit()
+        ddb.isincluded(args.dirA, args.dirB,
+                       otherddbfs=args.otherdb, basedir=args.mountpoint,
+                       display_included=args.display_included,
+                       display_notincluded=args.display_notincluded)
     elif args.subcommand=='diff':
         ddb=DDB(args.dbfile)
         ddb.diff(args.dirA, args.dirB)
@@ -889,11 +973,11 @@ if __name__ == "__main__":
         ddb.compute_dupfiles(basedir=args.mountpoint, nres=args.limit)
     elif args.subcommand=='comparedb':
         print(f"Files from {args.dbfile} that are not in {args.otherdb} (i.e. deleted files)")
-        ddb=DDB(args.dbfile)
+        ddb=DDB(args.dbfile, globignore=args.globignore)
         ddb.isincluded('', '', otherddbfs=args.otherdb, basedir='', checkfs=False)
-        print(f"\n_________\nFiles from {args.otherdb} that are not in {args.dbfile} (i.e. new files)")
-        ddb=DDB(args.otherdb)
-        ddb.isincluded('', '', otherddbfs=args.dbfile, basedir='', checkfs=False)
+        #print(f"\n_________\nFiles from {args.otherdb} that are not in {args.dbfile} (i.e. new files)")
+        #ddb=DDB(args.otherdb)
+        #ddb.isincluded('', '', otherddbfs=args.dbfile, basedir='', checkfs=False)
     elif args.subcommand=='migrate':
         shutil.copyfile(args.dbfile, args.newdb)
         ddb=DDB(args.newdb)
@@ -910,10 +994,14 @@ if __name__ == "__main__":
         ddb.compute_cachedups()
     elif args.subcommand=='showdups':
         ddb=DDB(args.dbfile)
-        ddb.showdups(basedir=args.mountpoint, nres=args.limit)
+        ddb.showdups(basedir=args.basedir, mountpoint=args.mountpoint, nres=args.limit)
     elif args.subcommand=='inodes':
         ddb=DDB(args.dbfile)
         ddb.show_same_inode(basedir=args.mountpoint, nres=args.limit)
     elif args.subcommand=='getincluded':
         ddb=DDB(args.dbfile)
-        ddb.getincluded(basedir=args.mountpoint)
+        ddb.getincluded(basedir=args.basedir)
+    elif args.subcommand=='testreg':
+        regex = regmulti(args.dbfile)
+        print(re.match(regex,args.teststring))
+    print()
