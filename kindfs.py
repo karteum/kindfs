@@ -445,10 +445,8 @@ class DDB():
         print("Phase 2")
         cachedups_d = defaultdict(int)
         n=0 ; ncount = cur.execute("select count(*) from cachedups_h where type='F'").fetchall()[0][0]
-        rs = cur.execute("select hash,ndups from cachedups_h where type='F'")
+        rs = cur.execute("select hash,ndups from cachedups_h where type='F' and hash!=0 and hash!=-1<<63 and size>0")  # and ndups<1000
         for hash,ndups in rs:
-            if(ndups>1000 or hash==0):
-                continue
             n+=1
             paths=[k[0] for k in cur2.execute("select path from entries where type='F' and hash=?",(hash,)).fetchall()]
             for path in paths:
@@ -673,9 +671,25 @@ class DDB():
             nsubfiles_rec_dups = cur2.execute("select count(*) from cachedups where type='F' and path like ?", (parentdir+'/%',)).fetchall()[0][0]
             print(f"{size>>20} MB, {100*nsubfiles_rec_dups/nsubfiles_rec:.1f}% dups : {parentdir}")
 
+    def nsubfiles_rec(self,adir,k=0):
+        if adir=='/' or adir=='':
+            return None
+        #rs1=cur_tmp.execute("select sum(nsubfiles) ns from entries where path like ? and type='D'", (adir+'%',)).fetchall()[0][0]
+        cur = self.conn.cursor()
+        nfiles,ndirs,nfiles_r=cur.execute("select nsubfiles,nsubdirs,nsubfiles_rec from entries where path=? and type='D'", (adir,)).fetchall()[0]
+        if nfiles_r!=None:
+            return nfiles_r
+        if ndirs>0:
+            rs = cur.execute("select path,nsubfiles,nsubdirs from entries where parentdir=? and type='D'", (adir,)).fetchall()
+            for path,nsubfiles,nsubdirs in rs:
+                nfiles += self.nsubfiles_rec(path,k+1) if nsubdirs>0 else nsubfiles
+        cur.execute("update entries set nsubfiles_rec=? where path=?",(nfiles,adir))
+        return nfiles
+
     def migrate(self):
         """Migrate from old to new DB schema (table 'entries' instead of tables 'files', 'dirs' and 'symlinks')"""
         tables = [k[0] for k in self.cur.execute("select name from sqlite_master where type='table'").fetchall()]
+        populate_nsubfiles_rec=False
         if 'files' in tables and 'dirs' in tables and not 'entries' in tables:
             print("Migrating DB")  # FIXME: nsbubfiles_rec is not processed yet
             self.cur.executescript('''
@@ -720,6 +734,22 @@ class DDB():
                 create view dirs as select id,parentdir,name,path,size,nsubfiles,nsubdirs,hash as xxh64be,st_mtime, st_mode, st_uid, st_gid, st_nlink, st_dev,dbsession,magictype from entries where type='D';
                 create view symlinks as select id,parentdir,name,path,symtarget as target,NULL as type,hash as xxh64be,dbsession,magictype from entries where type='S';
             ''')
+            populate_nsubfiles_rec = True
+        else:
+            sql = self.cur.execute("select sql from sqlite_master where type='table' and name='entries'").fetchall()[0]
+            if not 'nsubfiles_rec integer' in sql:
+                print("Adding column nsubfiles_rec")
+                self.cur.execute("alter table entries add nsubfiles_rec integer")
+                populate_nsubfiles_rec = True
+
+        if populate_nsubfiles_rec:
+            print("Generating nsubfiles_rec")
+            rs = self.cur.execute("select path,nsubfiles,nsubdirs from entries where type='D' and not path in ('','/')")
+            for path,nsubfiles,nsubdirs in rs:
+                if nsubdirs>0:
+                    nsubfiles_r = self.nsubfiles_rec(path)
+            self.cur.execute("update entries set nsubfiles_rec=nsubfiles where nsubdirs=0 and type='D'")
+        self.conn.commit()
 
 
 ######################################################
@@ -979,6 +1009,7 @@ if __name__ == "__main__":
         #ddb=DDB(args.otherdb)
         #ddb.isincluded('', '', otherddbfs=args.dbfile, basedir='', checkfs=False)
     elif args.subcommand=='migrate':
+        print(f"Copying {args.dbfile} -> {args.newdb}")
         shutil.copyfile(args.dbfile, args.newdb)
         ddb=DDB(args.newdb)
         ddb.migrate()
