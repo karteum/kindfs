@@ -47,7 +47,7 @@ def xxhash_file(filename, filesize=None, chunksize=FILE_HASH_CHUNKSIZE, inclsize
     """Return pseudo-hash of a file using xxhash64 on 3 MBytes of that file at its beginning/middle/end. Optionally include the size and filename into the pseudo-hash"""
     if filesize==None:
         filesize=int(os.stat(filename).st_size)
-    CHUNKSIZE=filesize if chunksize==None else chunksize # default value == 1<<20 i.e. 1 MByte chunk size
+    CHUNKSIZE=filesize if (chunksize==None or chunksize<1) else chunksize # default value == 1<<20 i.e. 1 MByte chunk size
     digest = xxhash.xxh64()
     if inclsize==True:
         digest.update(filesize)
@@ -79,7 +79,6 @@ def xxhash_file(filename, filesize=None, chunksize=FILE_HASH_CHUNKSIZE, inclsize
 def check_zerofile(filename):
     with open(filename,'rb') as fh:
         k = not any(fh.read())
-        print(k)
         return k
 
 def mydecode_path(pathbytes,fixparts=False):
@@ -124,7 +123,7 @@ def globmulti(globfile,var='path'):
 # DB class
 
 class DDB():
-    def __init__(self, dbname, domagic=False, rw=False, regignore=None, globignore=None):
+    def __init__(self, dbname, domagic=False, rw=False, regignore=None, globignore=None,chunksize=FILE_HASH_CHUNKSIZE):
         self.dbname=dbname
         self.conn = sqlite3.connect(dbname)
         self.conn.create_function("get_parentdir_len", 1, lambda x: 0 if os.path.dirname(x)=='/' else len(os.path.dirname(x)))
@@ -167,7 +166,9 @@ class DDB():
 
         self.regex = regmulti(regignore) if regignore else None
         self.globignore= globmulti(globignore) if globignore else ''
-        print(self.globignore)
+        self.chunksize=chunksize
+        print(f"Hash chunk size is {chunksize} bytes")
+        #print(self.globignore)
 
     def createdb(self):
         print("Creating / resetting DB")
@@ -347,7 +348,7 @@ class DDB():
             elif entry.is_file(follow_symlinks=False): # regular file. FIXME: sort by inode (like in https://github.com/pixelb/fslint/blob/master/fslint/findup) in order to speed up scanning ?
                 filestat = entry.stat(follow_symlinks=False)
                 entrysize = int(filestat.st_size)
-                fxxh = xxhash_file(path, entrysize)
+                fxxh = xxhash_file(path, entrysize, chunksize=self.chunksize)
                 mymagicid=self.magicid(path)
                 self.insert_db((
                     None,                             # id integer primary key autoincrement
@@ -416,9 +417,7 @@ class DDB():
 
     def compute_cachedups(self,basedir=""):
         cur = self.conn.cursor()
-        cur2 = self.conn.cursor()
-        cur3 = self.conn.cursor()
-        print("Computing duplicates...")
+        print("\nComputing duplicates...")
         wbasedir = f"where path like '{basedir}/%'" if basedir!='' else ''
         wbasedir2 = f"and path like '{basedir}/%'" if basedir!='' else ''
         cur.executescript(f'''
@@ -433,14 +432,18 @@ class DDB():
             insert into cachedups select entries.id,entries.size,ndups from entries inner join cachedups_h
                 on entries.hash=cachedups_h.hash where entries.size=cachedups_h.size {wbasedir2} and entries.type=cachedups_h.type
                 order by entries.size desc;
+        ''')
 
+    def compute_cachedups_d(self,basedir=""): # FIXME: Experimental function supporting getincluded()
+        cur = self.conn.cursor()
+        cur2 = self.conn.cursor()
+        #cur3 = self.conn.cursor()
+        cur.executescript(f'''
             drop table if exists cachedups_d;
             create table cachedups_d (entry_id integer not null, size integer, nsubdups integer);
             create index cachedups_d_entry_id_idx on cachedups_d(entry_id);
             create index cachedups_d_size_idx on cachedups_d(size);
         ''')
-
-        print("Phase 2")
         cachedups_d = defaultdict(int)
         n=0 ; ncount = cur.execute("select count(*) from cachedups_h where type='F'").fetchall()[0][0]
         rs = cur.execute("select hash,ndups from cachedups_h where type='F' and hash!=0 and hash!=-1<<63 and size>0")  # and ndups<1000
@@ -470,15 +473,15 @@ class DDB():
 
     def showdups(self,basedir="",mountpoint="",nres=None,orderbysize=True):
         """Main function to display the duplicate entries (file or dirs) sorted by decreasing size"""
-        orderby = "cachedups.size" if orderbysize else "nsubfiles_rec"
+        orderby = "cachedups.size*(ndups-1)" if orderbysize else "nsubfiles_rec"
         cur = self.conn.cursor()
         cur2 = self.conn.cursor()
         tables = [k[0] for k in self.cur.execute("select name from sqlite_master where type='table'").fetchall()]
         if not 'cachedups' in tables:
             self.compute_cachedups()
-        wbasedir = f"where path like '{basedir}/%'" if basedir!='' else "" #"where type='D'"
+        wbasedir = f"and path like '{basedir}/%'" if basedir!='' else "" #"where type='D'"
         limit_nres = f'limit {int(nres)}' if nres else ''
-        rs = cur.execute(f"select type,path,cachedups.size,hash,ndups,parentdir,nsubfiles_rec from cachedups inner join entries on entry_id=entries.id {wbasedir} order by {orderby} desc {limit_nres}") #where not parentdir in (select path from cachedups)
+        rs = cur.execute(f"select type,path,cachedups.size,hash,ndups,parentdir,nsubfiles_rec from cachedups inner join entries on entry_id=entries.id where cachedups.size>0 {wbasedir} order by {orderby} desc {limit_nres}") #where not parentdir in (select path from cachedups)
         for ftype,path,size,hash,ndups,parentdir,nsubfiles_rec in rs:
             pdir_isdup = cur2.execute("select count(*) from cachedups inner join entries on entry_id=entries.id where path=?", (parentdir,)).fetchall()[0][0]
             path_real = mountpoint+path
@@ -490,6 +493,7 @@ class DDB():
                 path_real = colored(path_real, 'cyan')
 
             print(colored(f"{ftype} 0x{hash+(1<<63):0>16x}, {ndups} * {size>>20} Mo | {nsubfiles_rec} files : ", 'yellow') + path_real)
+            #print(colored(f"{ftype} {hash+(1<<63)}, {ndups} * {size} | {nsubfiles_rec} files : ", 'yellow') + path_real)
 
     def show_same_inode(self,basedir="",nres=None):
         """Same as showdups() but only return entries with identical inodes"""
@@ -884,6 +888,7 @@ if __name__ == "__main__":
     parser_scan = subparsers.add_parser('scan', help="Scan directory")
     parser_scan.add_argument("path", help="path to scan")
     parser_scan.add_argument("--resetdb", "-R", help="Reset DB", action='store_true', default=False)
+    parser_scan.add_argument("--chunksize", "-C", help="file chunk size in bytes for xxhash (default is 1 MB)", default=FILE_HASH_CHUNKSIZE>>10)
 
     parser_mount = subparsers.add_parser('mount')
     parser_mount.add_argument("mountpoint", help="Mount point")
@@ -896,7 +901,7 @@ if __name__ == "__main__":
     parser_isincluded.add_argument("--display_included", "-i", help="Display files from dirA that are in dirB", action='store_true', default=False)
     parser_isincluded.add_argument("--display_notincluded", "-n", help="Display files from dirA that are not in dirB", action='store_true', default=False)
     #parser_isincluded.add_argument("--raw", "-r", help="Display files from dirA that are not in dirB", action='store_true', default=False)
-    parser_isincluded.add_argument("--globignore", "-z", help="Glob file to ignore results", default=None)
+    parser_isincluded.add_argument("--globignore", "-g", help="Glob file to ignore results", default=None)
 
     parser_comparedb = subparsers.add_parser('comparedb', help="Compare two DB")
     parser_comparedb.add_argument('otherdb', help="DB to compare with")
@@ -920,6 +925,7 @@ if __name__ == "__main__":
     parser_dupdirs.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default='')
     parser_dupdirs.add_argument("--basedir", "-b", help="Basedir", default='')
     parser_dupdirs.add_argument("--limit", "-l", help="Max number of results", default=None)
+    parser_dupdirs.add_argument("--nsubfiles_first", "-n", help="sort by number of subfiles rather than size", action='store_true', default=False)
 
     # Legacy
     parser_dupfiles = subparsers.add_parser('dupfiles', help="show duplicate files")
@@ -928,6 +934,7 @@ if __name__ == "__main__":
     parser_dupdirs = subparsers.add_parser('dupdirs', help="show duplicate dirs")
     parser_dupdirs.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default=None)
     parser_dupdirs.add_argument("--limit", "-l", help="Max number of results", default=None)
+
     parser_inodes = subparsers.add_parser('inodes', help="show duplicate dirs")
     parser_inodes.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default=None)
     parser_inodes.add_argument("--limit", "-l", help="Max number of results", default=None)
@@ -945,10 +952,11 @@ if __name__ == "__main__":
             os.remove(args.dbfile)
             #ddb.createdb()
             #ddb.conn.commit()
-        ddb=DDB(args.dbfile, rw=True)
+        ddb=DDB(args.dbfile, rw=True, chunksize=int(args.chunksize)<<10)
         try:
             ddb.dirscan(args.path)
             ddb.sync_db()
+            ddb.compute_cachedups()
             ddb.conn.close()
         except(KeyboardInterrupt):
             ddb.sync_db()
@@ -1003,7 +1011,7 @@ if __name__ == "__main__":
         ddb.compute_cachedups()
     elif args.subcommand=='showdups':
         ddb=DDB(args.dbfile)
-        ddb.showdups(basedir=args.basedir, mountpoint=args.mountpoint, nres=args.limit)
+        ddb.showdups(basedir=args.basedir, mountpoint=args.mountpoint, nres=args.limit, orderbysize=not args.nsubfiles_first)
     elif args.subcommand=='inodes':
         ddb=DDB(args.dbfile)
         ddb.show_same_inode(basedir=args.mountpoint, nres=args.limit)
