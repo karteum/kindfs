@@ -2,8 +2,10 @@
 # -*- coding: utf-8 -*-
 # Author: Adrien Demarez (adrien.demarez@free.fr)
 # License: GPLv3
-# Prerequisite : pip install xxhash numpy fusepy python-magic
+# Prerequisite : pip install xxhash numpy fusepy python-magic termcolor
 # Beware : this software only hashes portions of files for speed (and therefore may consider that some files/dirs are identical when they are not really). Use this program at your own risk and only when you know what you are doing ! (and double-check with filenames + if unsure, triple-check with full md5sum or diff -r !)
+
+# FIXME: in some cases, it makes parentdir_len=1 and parentdir="/"
 
 # Parameters
 DB_COMMIT_PERIODICITY=5  # flush/commit DB every x seconds. Higher values implies more RAM usage but higher I/O performance
@@ -11,7 +13,6 @@ DISPLAY_PERIODICITY=0.1
 FILE_HASH_CHUNKSIZE=1<<20  # default is to hash 1MB data at begin/middle/end of files i.e. 3MB total. Smaller values means faster scan but more risk to miss differences in files. set "None" if you want to scan 100% of the contents of your files for more safety (at the expense of scanning speed)
 
 import sqlite3,xxhash
-#from crc32c import crc32
 import fnmatch
 import math
 import os, errno, sys, stat
@@ -55,7 +56,7 @@ def xxhash_file(filename, filesize=None, chunksize=FILE_HASH_CHUNKSIZE, inclsize
         digest.update(os.path.basename(filename))
     with open(filename,'rb') as fh:
         if(filesize<=3*CHUNKSIZE):
-            data = fh.read()
+            data = fh.read() # FIXME: what if CHUNKSIZE==filesize and filesize is bigger than RAM ? use mmap()...
             notallzeros = any(data)
             digest.update(data)
         else:
@@ -119,6 +120,7 @@ def globmulti(globfile,var='path'):
     globstr = "(" + " and ".join(globarr) + ")"
     return globstr
 
+
 ######################################################
 # DB class
 
@@ -131,7 +133,7 @@ class DDB():
         self.processedfiles = 0
         self.processedsize = 0
         if rw==True:
-            print('Looking for resume')
+            print('Looking for resume') # FIXME: make it also work to load the previous version of a db and only scan dirs with updated mtime
             tables = [k[0] for k in self.cur.execute("select name from sqlite_master where type='table'").fetchall()]
             if 'entries' in tables:
                 mydirs = self.cur.execute("select path,size,hash,nsubfiles from entries where type='D'").fetchall()
@@ -196,6 +198,7 @@ class DDB():
             );
             create index entries_parentdir_idx on entries(parentdir);
             create index entries_path_idx on entries(path);
+            create index entries_name_idx on entries(name);
             create index entries_size_idx on entries(size);
             create index entries_hash_idx on entries(hash);
 
@@ -289,7 +292,7 @@ class DDB():
 
         #print((bdir,processed,init_path,parentdir,self.mytime))
         dir,dir_printable = mydecode_path(bdir)
-        parentdir_len = 0
+        parentdir_len = 0 # FIXME: in some cases, it makes parentdir_len=1 and parentdir="/"
         if init_path==None:
             init_path=dir.rstrip('/')
             print("\n==== Starting scan ====\n")
@@ -426,7 +429,8 @@ class DDB():
             insert into cachedups_h select hash,size,count(*),type from entries {wbasedir} group by hash,size,type having count(*)>1;
 
             drop table if exists cachedups;
-            create table cachedups (entry_id integer not null, size, ndups integer);
+            create table cachedups (entry_id integer not null, size integer, ndups integer, totaldupsize integer GENERATED ALWAYS AS (size*(ndups-1)) VIRTUAL);
+            create index cachedups_totaldupsize_idx on cachedups(totaldupsize);
             create index cachedups_entry_id_idx on cachedups(entry_id);
             create index cachedups_size_idx on cachedups(size);
             insert into cachedups select entries.id,entries.size,ndups from entries inner join cachedups_h
@@ -473,7 +477,8 @@ class DDB():
 
     def showdups(self,basedir="",mountpoint="",nres=None,orderbysize=True):
         """Main function to display the duplicate entries (file or dirs) sorted by decreasing size"""
-        orderby = "cachedups.size*(ndups-1)" if orderbysize else "nsubfiles_rec"
+        orderby = "totaldupsize" if orderbysize else "nsubfiles_rec"
+        #orderby = "cachedups.size" if orderbysize else "nsubfiles_rec"
         cur = self.conn.cursor()
         cur2 = self.conn.cursor()
         tables = [k[0] for k in self.cur.execute("select name from sqlite_master where type='table'").fetchall()]
@@ -577,6 +582,30 @@ class DDB():
             files = [k[0] for k in cur2.execute("select name from entries where parentdir=? and (type='F' or type='S')",(dir,))]
             #files.append([k[0] for k in cur2.execute('select name from symlinks where parentdir=?',(dir,))])
             yield dir,dirs,files
+
+    def grepext(self, wordlist, ext='.txt', init_path='', mountpoint='', case_insensitive=True):
+        cur = self.conn.cursor()
+        count = cur.execute("select count(path) from entries where type='F' and name like ?", ('%'+ext,)).fetchall()[0][0]
+        k=0
+        pct=0
+        print(wordlist)
+        if case_insensitive:
+            for idx in range(len(wordlist)):
+                wordlist[idx]=wordlist[idx].lower()
+        for res in cur.execute("select path from entries where type='F' and name like ?", ('%'+ext,)):
+            path=res[0]
+            try: btext = open(mountpoint+'/'+path,"rb").read()
+            except (FileNotFoundError,PermissionError): print('\033[2K\r__error file__: '+path)
+            for w in wordlist:
+                try: text = btext.decode()
+                except UnicodeDecodeError: text = btext.decode(encoding="latin1")
+                if case_insensitive: text=text.lower()
+                #if w.encode() in open(bytes(mountpoint+'/'+path, encoding='utf-8'),"rb").read():
+                if w in text:
+                    print('\033[2K\r'+path)
+            k+=1
+            pct = 100*k//count
+            sys.stderr.write(f"\033[2K\r{pct} % : {k} / {count}")
 
     def dumpdir(self, adir=''):
         """Dumps the contents of a dir (and all subdirs) with hash and size"""
@@ -889,6 +918,7 @@ if __name__ == "__main__":
     parser_scan.add_argument("path", help="path to scan")
     parser_scan.add_argument("--resetdb", "-R", help="Reset DB", action='store_true', default=False)
     parser_scan.add_argument("--chunksize", "-C", help="file chunk size in bytes for xxhash (default is 1 MB)", default=FILE_HASH_CHUNKSIZE>>10)
+    # FIXME: add option to use a previous db, and skip dirs (+ copy the previous db contents for those subdirs) when mtime has not changed
 
     parser_mount = subparsers.add_parser('mount')
     parser_mount.add_argument("mountpoint", help="Mount point")
@@ -921,11 +951,15 @@ if __name__ == "__main__":
     subparsers.add_parser('check_zerofile', help="Check whether file is made only of zeros (e.g. corrupted)")
 
     subparsers.add_parser('compute_cachedups', help="Compute cachedups")
-    parser_dupdirs = subparsers.add_parser('showdups', help="show duplicates")
-    parser_dupdirs.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default='')
-    parser_dupdirs.add_argument("--basedir", "-b", help="Basedir", default='')
-    parser_dupdirs.add_argument("--limit", "-l", help="Max number of results", default=None)
-    parser_dupdirs.add_argument("--nsubfiles_first", "-n", help="sort by number of subfiles rather than size", action='store_true', default=False)
+    parser_showdups = subparsers.add_parser('showdups', help="show duplicates")
+    parser_showdups.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default='')
+    parser_showdups.add_argument("--basedir", "-b", help="Basedir", default='')
+    parser_showdups.add_argument("--limit", "-l", help="Max number of results", default=None)
+    parser_showdups.add_argument("--nsubfiles_first", "-n", help="sort by number of subfiles rather than size", action='store_true', default=False)
+
+    parser_grep = subparsers.add_parser('grep', help="grep text")
+    parser_grep.add_argument("--mountpoint", "-m", help="mountpoint", default='')
+    parser_grep.add_argument("--wordlist", "-w", help="mountpoint", nargs="+", required=True)
 
     # Legacy
     parser_dupfiles = subparsers.add_parser('dupfiles', help="show duplicate files")
@@ -1005,7 +1039,7 @@ if __name__ == "__main__":
         fxxh = xxhash_file(args.dbfile, entrysize)
         print(f"0x{fxxh+(1<<63):0>16x}, {fxxh+(1<<63)} {fxxh}, {entrysize>>20} Mo : {args.dbfile}")
     elif args.subcommand=='check_zerofile':
-        check_zerofile(args.dbfile)
+        print(check_zerofile(args.dbfile))
     elif args.subcommand=='compute_cachedups':
         ddb=DDB(args.dbfile)
         ddb.compute_cachedups()
@@ -1021,4 +1055,7 @@ if __name__ == "__main__":
     elif args.subcommand=='testreg':
         regex = regmulti(args.dbfile)
         print(re.match(regex,args.teststring))
+    elif args.subcommand=='grep':
+        ddb=DDB(args.dbfile)
+        ddb.grepext(wordlist=args.wordlist, mountpoint=args.mountpoint)
     print()
