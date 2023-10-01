@@ -42,7 +42,7 @@ class DDBfs(Operations):
 
     def dbpath(self,path1):
         """Enable to mount a sub-part of the FS when init_path!='/'"""
-        path=path1.replace("/", self.init_path, 1).rstrip('/')
+        path=path1.replace("/", self.init_path, 1).rstrip('/') if path1!=self.init_path else '/'
         return path
 
     #@logme
@@ -114,7 +114,7 @@ class DDBfs(Operations):
         path=path1.replace("/", self.init_path, 1).rstrip('/')
         print('unlink %s' % (path))
         cur = self.conn.cursor()
-        cur.execute('insert into postops values (null,?,?,?,?)', ('unlink', os.path.dirname(path), path, null))
+        cur.execute('insert into postops values (null,?,?,?,?)', ('unlink', os.path.dirname(path), path, None))
 
     #@logme
     def rename(self, old, new):
@@ -129,14 +129,14 @@ class DDBfs(Operations):
         path=path1.replace("/", self.init_path, 1).rstrip('/')
         print('mkdir %s' % (path))
         cur = self.conn.cursor()
-        cur.execute('insert into postops values (null,?,?,?,?)', ('mkdir', os.path.dirname(path), path, null))
+        cur.execute('insert into postops values (null,?,?,?,?)', ('mkdir', os.path.dirname(path), path, None))
 
     #@logme
     def rmdir(self, path1):
         path=path1.replace("/", self.init_path, 1).rstrip('/')
         print('rmdir %s' % (path))
         cur = self.conn.cursor()
-        cur.execute('insert into postops values (null,?,?,?,?)', ('rmdir', os.path.dirname(path), path, null))
+        cur.execute('insert into postops values (null,?,?,?,?)', ('rmdir', os.path.dirname(path), path, None))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
