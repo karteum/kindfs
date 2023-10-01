@@ -13,7 +13,7 @@ DISPLAY_PERIODICITY=0.1
 FILE_HASH_CHUNKSIZE=1<<20  # default is to hash 1MB data at begin/middle/end of files i.e. 3MB total. Smaller values means faster scan but more risk to miss differences in files. set "None" if you want to scan 100% of the contents of your files for more safety (at the expense of scanning speed)
 
 import sqlite3,xxhash
-import fnmatch
+#import fnmatch
 import math
 import os, errno, sys, stat
 import array
@@ -34,14 +34,6 @@ except ImportError:
 #import chardet
 #import codecs
 #import cProfile
-
-import functools
-def logme(f):
-    @functools.wraps(f)
-    def wrapped(*args, **kwargs):
-        print(f'________ {f.__name__} {args} {kwargs}')
-        return f(*args, **kwargs)
-    return wrapped
 
 def xxhash_file(filename, filesize=None, chunksize=FILE_HASH_CHUNKSIZE, inclsize=False, inclname=False):
     """Return pseudo-hash of a file using xxhash64 on 3 MBytes of that file at its beginning/middle/end. Optionally include the size and filename into the pseudo-hash"""
@@ -184,7 +176,8 @@ class DDB():
                 path text UNIQUE NOT NULL,
                 parentdir_len integer,
                 parentdir text GENERATED ALWAYS AS (substr(path,1,parentdir_len)) VIRTUAL,
-                name text GENERATED ALWAYS AS (substr(path,parentdir_len+2)) VIRTUAL,
+                name text GENERATED ALWAYS AS (substr(path,parentdir_len+iif(parentdir_len<2,1,2))) VIRTUAL,
+                depht integer GENERATED ALWAYS AS (length(path)-length(replace(path,'/',''))-1) VIRTUAL,
                 size integer,
                 hash integer,
                 magictype integer,
@@ -200,6 +193,7 @@ class DDB():
             create index entries_name_idx on entries(name);
             create index entries_size_idx on entries(size);
             create index entries_hash_idx on entries(hash);
+            create index entries_depht_idx on entries(depht);
 
             drop view if exists files;
             create view files as select id,parentdir,name,path,size,hash as xxh64be,st_mtime, st_mode, st_uid, st_gid, st_ino, st_nlink, st_dev,dbsession,magictype from entries where type='F';
@@ -213,6 +207,7 @@ class DDB():
                 id integer primary key autoincrement,
                 timestamp integer not null,
                 init_path text
+                -- dbversion integer
             );
 
             drop table if exists magictypes;
@@ -277,7 +272,7 @@ class DDB():
         if isinstance(bdir,str):
             bdir=bytes(bdir, encoding='utf-8') # This avoids issues when walking through a filesystem with various encodings...
         def dbpath(path):
-            return path.replace(init_path, '')
+            return path.replace(init_path, '') if path!=init_path else "/"
         def printprogress():
             mytime2=time.time()
             if mytime2-self.timer_print>DISPLAY_PERIODICITY:
@@ -291,14 +286,12 @@ class DDB():
 
         #print((bdir,processed,init_path,parentdir,self.mytime))
         dir,dir_printable = mydecode_path(bdir)
-        parentdir_len = 0 # FIXME: in some cases, it makes parentdir_len=1 and parentdir="/"
-        if init_path==None:
+        if init_path==None: # root call (before recursion)
             init_path=dir.rstrip('/')
             print("\n==== Starting scan ====\n")
             self.cur.execute('insert or replace into dbsessions values (null, ?,?)', (int(self.timer_print), init_path))
             self.param_id=self.cur.lastrowid
-        elif parentdir!='/':
-            parentdir_len = len(dbpath(parentdir))
+        parentdir_len = len(dbpath(parentdir)) if parentdir!=None else 0
         curdir_len = len(dbpath(dir))
 
         if hasattr(self,'dbcache_dirs'): # Resume / speedup scan
