@@ -8,16 +8,15 @@
 # FIXME: in some cases, it makes parentdir_len=1 and parentdir="/"
 
 # Parameters
-DB_COMMIT_PERIODICITY=5  # flush/commit DB every x seconds. Higher values implies more RAM usage but higher I/O performance
-DISPLAY_PERIODICITY=0.1
+DB_COMMIT_PERIODICITY=0.3  # flush/commit DB every x seconds. Higher values implies more RAM usage but higher I/O performance
+DISPLAY_PERIODICITY=0.05
 FILE_HASH_CHUNKSIZE=1<<20  # default is to hash 1MB data at begin/middle/end of files i.e. 3MB total. Smaller values means faster scan but more risk to miss differences in files. set "None" if you want to scan 100% of the contents of your files for more safety (at the expense of scanning speed)
 
 import sqlite3,xxhash
 #import fnmatch
 import math
 import os, errno, sys, stat
-import array
-import numpy as np
+from array import array # More lightweight than numpy
 from collections import defaultdict
 import time
 import magic
@@ -39,6 +38,8 @@ def xxhash_file(filename, filesize=None, chunksize=FILE_HASH_CHUNKSIZE, inclsize
     """Return pseudo-hash of a file using xxhash64 on 3 MBytes of that file at its beginning/middle/end. Optionally include the size and filename into the pseudo-hash"""
     if filesize==None:
         filesize=int(os.stat(filename).st_size)
+    if filesize==0:
+        return 0
     CHUNKSIZE=filesize if (chunksize==None or chunksize<1) else chunksize # default value == 1<<20 i.e. 1 MByte chunk size
     digest = xxhash.xxh64()
     if inclsize==True:
@@ -48,24 +49,24 @@ def xxhash_file(filename, filesize=None, chunksize=FILE_HASH_CHUNKSIZE, inclsize
     with open(filename,'rb') as fh:
         if(filesize<=3*CHUNKSIZE):
             data = fh.read() # FIXME: what if CHUNKSIZE==filesize and filesize is bigger than RAM ? use mmap()...
-            notallzeros = any(data)
+            is_there_data = any(data)
             digest.update(data)
         else:
             data = fh.read(CHUNKSIZE)
-            notallzeros = any(data)
+            is_there_data = any(data)
             digest.update(data)
 
             fh.seek(math.floor(filesize/2-CHUNKSIZE/2))
             data = fh.read(CHUNKSIZE)
-            notallzeros = notallzeros | any(data)
+            is_there_data |= any(data)
             digest.update(data)
 
             fh.seek(filesize-CHUNKSIZE)
             data = fh.read(CHUNKSIZE)
-            notallzeros = notallzeros | any(data)
+            is_there_data |= any(data)
             digest.update(data)
-    if not notallzeros and (filesize<=3*CHUNKSIZE or check_zerofile(filename)):
-        return 0
+    if not is_there_data and (filesize<=3*CHUNKSIZE or check_zerofile(filename)):
+        return 0  # File with size >0 but totally filled with zeros...
     return digest.intdigest() - (1<<63) # return integer rather than hexdigest because it is more efficient. "- (1<<63)" is there because SQLite3 unfortunately only supports signed 64 bits integers and doesn't support unsigned
 
 def check_zerofile(filename):
@@ -160,86 +161,20 @@ class DDB():
         self.regex = regmulti(regignore) if regignore else None
         self.globignore= globmulti(globignore) if globignore else ''
         self.chunksize=chunksize
-        print(f"Hash chunk size is {chunksize} bytes")
+        #print(f"Hash chunk size is {chunksize} bytes")
         #print(self.globignore)
 
     def createdb(self):
         print("Creating / resetting DB")
         cur = self.conn.cursor()
-        # Create the DB. Notice that 'path' is duplicate information for 'parentdir/name' which may seem suboptimal, yet it is useful to have both for performance in various situations when using indexes (e.g. indexed full path is useful for FUSE)
-        # TODO: add nsubfiles_tot for cumulative info on subfiles for dirs
-        cur.executescript('''
-            drop table if exists entries;
-            create table entries(
-                id integer primary key autoincrement,
-                type CHAR(1) NOT NULL,
-                path text UNIQUE NOT NULL,
-                parentdir_len integer,
-                parentdir text GENERATED ALWAYS AS (substr(path,1,parentdir_len)) VIRTUAL,
-                name text GENERATED ALWAYS AS (substr(path,parentdir_len+iif(parentdir_len<2,1,2))) VIRTUAL,
-                depht integer GENERATED ALWAYS AS (length(path)-length(replace(path,'/',''))-1) VIRTUAL,
-                size integer,
-                hash integer,
-                magictype integer,
-                nsubdirs integer,
-                nsubfiles integer,
-                nsubfiles_rec integer,
-                symtarget text,
-                st_mtime integer, st_mode integer, st_uid integer, st_gid integer, st_ino integer, st_nlink integer, st_dev integer,
-                dbsession integer not null
-            );
-            create index entries_parentdir_idx on entries(parentdir);
-            create index entries_path_idx on entries(path);
-            create index entries_name_idx on entries(name);
-            create index entries_size_idx on entries(size);
-            create index entries_hash_idx on entries(hash);
-            create index entries_depht_idx on entries(depht);
-
-            drop view if exists files;
-            create view files as select id,parentdir,name,path,size,hash as xxh64be,st_mtime, st_mode, st_uid, st_gid, st_ino, st_nlink, st_dev,dbsession,magictype from entries where type='F';
-            drop view if exists dirs;
-            create view dirs as select id,parentdir,name,path,size,nsubfiles,nsubdirs,hash as xxh64be,st_mtime, st_mode, st_uid, st_gid, st_nlink, st_dev,dbsession,magictype from entries where type='D';
-            drop view if exists symlinks;
-            create view symlinks as select id,parentdir,name,path,symtarget as target,NULL as type,hash as xxh64be,dbsession,magictype from entries where type='S';
-
-            drop table if exists dbsessions;
-            create table dbsessions(
-                id integer primary key autoincrement,
-                timestamp integer not null,
-                init_path text
-                -- dbversion integer
-            );
-
-            drop table if exists magictypes;
-            create table magictypes(
-                id integer primary key autoincrement,
-                magicmime text,
-                magictype text
-            );
-            create index magictypes_magictype_idx on magictypes(magictype);
-
-            drop table if exists postops;
-            create table postops (
-                id integer primary key autoincrement,
-                op text,
-                parentdir text,
-                path text,
-                arg text
-            );
-            create index postops_parentdir_idx on postops(parentdir);
-            create index postops_path_idx on postops(path);
-
-            PRAGMA main.page_size=4096;
-            PRAGMA main.cache_size=10000;
-            PRAGMA main.locking_mode=EXCLUSIVE;
-            PRAGMA main.synchronous=NORMAL;
-        ''') # PRAGMA main.journal_mode=WAL;
+        with open("kindfs.sql", encoding='utf-8') as schema:
+            cur.executescript(schema.read())
 
     def magicid(self, path, dofull=True, domime=True):
         """Compute 'magic' filetype from libmagic, insert it in DB (if not already there) and return the ID of that entry"""
         if self.domagic==False or (dofull==False and domime==False):
             return 0
-        magictype = re.sub(', BuildID\[sha1\]=[0-9a-f]*','',magic.from_file(path)) if dofull else None
+        magictype = re.sub(', BuildID\\[sha1\\]=[0-9a-f]*','',magic.from_file(path)) if dofull else None
         magicmime = magic.from_file(path, mime=True) if domime else None
         if magictype in self.magictypes:
             return self.magictypes[magictype]
@@ -267,11 +202,15 @@ class DDB():
             self.timer_insert=time.time() # Not 'mytime2' since sync_db() itself might take a few seconds, maybe more than DB_COMMIT_PERIODICITY
             #self.cur.execute(f'insert or replace into {table} values ({",".join("?" for k in vec)})', vec) #q = '(' + '?,' * (len(vec)-1) + '?)'
 
-    def dirscan(self, bdir, init_path=None, parentdir=None, dirstat=None, dirlevel=0):
+    def insert_db1(self,vec):  # For debug purposes, yet slower than the batch insert (even with pragmas and caching)
+        self.cur.execute(f'insert or replace into entries values ({",".join("?" for k in vec)})', vec)
+
+    def dirscan(self, bdir, init_path=None, parentdir=None, dirstat=None, dirlevel=0, prevdb=None):
         """Recursively scan a dir/ (taking care of encoding issues), compute checksums and store metadata in the DB"""
         if isinstance(bdir,str):
             bdir=bytes(bdir, encoding='utf-8') # This avoids issues when walking through a filesystem with various encodings...
         def dbpath(path):
+            if os.sep != '/': path=path.replace(os.sep, '/')
             return path.replace(init_path, '') if path!=init_path else "/"
         def printprogress():
             mytime2=time.time()
@@ -304,8 +243,12 @@ class DDB():
             #else: # FIXME: seems counter productive (sqlite bottleneck ?)
             #    refdb_alreadythere={k[0]:k[1] for k in self.cur_ref.execute("select path,size from files where parentdir=?", (dbpath(dir_printable),)).fetchall() }
 
+        if prevdb is not None:
+            connprev = sqlite3.connect(prevdb)
+            curprev = connprev.cursor()
+
         dirsize=0 # size of current dir including subdirs
-        dircontents = array.array('q') # Array of hashes for the contents of current dir. array('q') is more space-efficient than linked list, and better than numpy in this phase as it can easily grow without destroying/recreating the array
+        dircontents = array('q') # Array of hashes for the contents of current dir. array('q') is more space-efficient than linked list, and better than numpy in this phase as it can easily grow without destroying/recreating the array
         dir_numfiles = 0
         dir_numdirs = 0
         dir_nsubfiles_rec = 0
@@ -316,20 +259,25 @@ class DDB():
             if not os.path.exists(path) or not os.access(path, os.R_OK):
                 continue
             if entry.is_dir(follow_symlinks=False):
-                entrysize,dxxh,nsr = self.dirscan(entry.path,init_path=init_path,parentdir=dir_printable,dirstat=entry.stat(follow_symlinks=False),dirlevel=dirlevel+1)
-                # Insertion in DB is below at dir toplevel (and this is a recursive call)
-                dircontents.append(dxxh)
-                dir_numdirs+=1
-                dir_nsubfiles_rec += nsr
+                try:
+                    entrysize,dxxh,nsr = self.dirscan(entry.path,init_path=init_path,parentdir=dir_printable,dirstat=entry.stat(follow_symlinks=False),dirlevel=dirlevel+1)
+                    # Insertion in DB is below at dir toplevel (and this is a recursive call)
+                    dircontents.append(dxxh)
+                    dir_numdirs+=1
+                    dir_nsubfiles_rec += nsr
+                except:
+                    sys.stderr.write(f"\n=> Error in {path_printable}\n")
             elif entry.is_symlink():
                 ltarget = os.readlink(path)
                 lxxh = xxhash.xxh64(name + ' -> ' + ltarget).intdigest() - (1<<63)
                 dircontents.append(lxxh)
+                ext_len = path_in_db.rindex('.') if "." in path_in_db[curdir_len:] else None
                 self.insert_db((
                     None,                               # id integer primary key autoincrement
                     'S',                                # type: symlink
                     path_in_db,                         # path
                     curdir_len,                         # parentdir_len
+                    ext_len,                            # ext_len
                     None,                               # size
                     lxxh,                               # hash
                     None, None, None, None,             # magictype, nsubdirs, nsubfiles, nsubfiles_rec
@@ -343,18 +291,24 @@ class DDB():
             elif entry.is_file(follow_symlinks=False): # regular file. FIXME: sort by inode (like in https://github.com/pixelb/fslint/blob/master/fslint/findup) in order to speed up scanning ?
                 filestat = entry.stat(follow_symlinks=False)
                 entrysize = int(filestat.st_size)
-                fxxh = xxhash_file(path, entrysize, chunksize=self.chunksize)
-                mymagicid=self.magicid(path)
+                fxxh = None
+                if prevdb is not None:
+                    fxxh = curprev.execute("select size,st_mtime,hash where type='F' and path=? and size=? and st_mtime=?", path_in_db, entrysize, int(filestat.st_mtime)).fetchall[0][0]
+                if fxxh is None: # fxxh may still be None after the previous query
+                    fxxh = xxhash_file(path, entrysize, chunksize=self.chunksize)
+                ext_len = path_in_db.rindex('.') if "." in path_in_db[curdir_len:] else None
+                mymagicid = self.magicid(path)
                 self.insert_db((
                     None,                             # id integer primary key autoincrement
                     'F',                              # type: file
                     path_in_db,                       # path
                     curdir_len,                       # parentdir_len
+                    ext_len,                          # ext_len
                     entrysize,                        # size
                     fxxh,                             # hash
                     mymagicid,                        # magictype
                     None, None, None, None,           # nsubdirs, nsubfiles, nsubfiles_rec, symtarget
-                    int(filestat.st_mtime), filestat.st_mode, filestat.st_uid, filestat.st_gid, filestat.st_ino, filestat.st_nlink, filestat.st_dev,
+                    int(filestat.st_mtime), filestat.st_mode, filestat.st_uid, filestat.st_gid, filestat.st_ino, filestat.st_nlink, filestat.st_dev-(1<<63),
                     self.param_id                     # dbsession
                 ))
                 dircontents.append(fxxh) #bisect.insort(dircontents[dir], xxh)
@@ -368,9 +322,8 @@ class DDB():
                 #entrysize=0
             dirsize += entrysize
             printprogress()
-        npdircontents = np.array(dircontents, dtype=np.int64)
-        npdircontents.sort()
-        dxxh = xxhash.xxh64(npdircontents.tobytes()).intdigest() - (1<<63)
+        dircontents = array('q', sorted(dircontents))
+        dxxh = 0 if dirsize==0 else xxhash.xxh64(dircontents.tobytes()).intdigest() - (1<<63)
         #bisect.insort(dircontents[os.path.dirname(dir)], dirxxh)
         if dirstat==None:
             dirstat = os.lstat(dir)
@@ -380,6 +333,7 @@ class DDB():
             'D',                              # type: dir
             path_in_db,                       # path
             parentdir_len,                    # parentdir_len
+            None,                             # ext_len
             dirsize,                          # size
             dxxh,                             # hash
             None,                             # magictype
@@ -387,7 +341,7 @@ class DDB():
             dir_numfiles,                     # nsubfiles
             dir_nsubfiles_rec,                # nsubfiles_rec
             None,                             # symtarget
-            int(dirstat.st_mtime), dirstat.st_mode, dirstat.st_uid, dirstat.st_gid, None ,dirstat.st_nlink, dirstat.st_dev,
+            int(dirstat.st_mtime), dirstat.st_mode, dirstat.st_uid, dirstat.st_gid, None ,dirstat.st_nlink, dirstat.st_dev-(1<<63),
             self.param_id                     # dbsession
         ))
         return dirsize,dxxh,dir_nsubfiles_rec
@@ -418,7 +372,7 @@ class DDB():
         cur.executescript(f'''
             drop table if exists cachedups_h;
             create table cachedups_h (hash integer, size integer, ndups integer,type char(1));
-            insert into cachedups_h select hash,size,count(*),type from entries {wbasedir} group by hash,size,type having count(*)>1;
+            insert into cachedups_h select hash,size,count(*),type from entries {wbasedir} group by hash,size,type having count(*)>1 and size>0;
 
             drop table if exists cachedups;
             create table cachedups (entry_id integer not null, size integer, ndups integer, totaldupsize integer GENERATED ALWAYS AS (size*(ndups-1)) VIRTUAL);
@@ -429,6 +383,36 @@ class DDB():
                 on entries.hash=cachedups_h.hash where entries.size=cachedups_h.size {wbasedir2} and entries.type=cachedups_h.type
                 order by entries.size desc;
         ''')
+
+    def get_rec_pcdup(self, dir, entry_id=None):
+        # compute the % of dups within dirs
+        cur = self.conn.cursor()
+        if entry_id is None:
+            cur.execute("create table cachedups_d (entry_id integer not null, szdup integer, ndupsubs integer)")
+            entry_id = cur.execute("select id from entries where path=?", (dir,)).fetchall()[0][0]
+        sz_n_dup = 0 + 0j
+        rs = cur.execute("select id, path, type, size, nsubfiles_rec from entries where parentdir=?",(dir,))
+        for rowid, path, entrytype, size, nrec in rs:
+            szdup_entry = cur.execute("select size from cachedups inner join entries on entry_id=entries.id where path=?", (path,)).fetchall()[0][0]
+            if szdup_entry is not None:
+                sz_n_dup += szdup_entry + 1j*(nrec if entrytype == "D" else 1)
+            elif entrytype == "D":
+                sz_n_dup += self.get_rec_pcdup(path, entry_id=rowid)
+
+        cur.execute("insert into cachedups_d (id, szdup, ndupsubs) values (?,?)", entry_id, sz_n_dup.real, sz_n_dup.imag)
+        return sz_n_dup
+
+    def compute_cachedups_dpartial(self,basedir=""):
+        cur = self.conn.cursor()
+        cur2 = self.conn.cursor()
+        wbasedir = f"where path like '{basedir}/%'" if basedir!='' else ''
+        orderbysize=True
+        orderby = "entries.size" if orderbysize else "nsubfiles_rec"
+        rs = cur.execute(f"select type,path,cachedups.size,hash,ndups,parentdir,nsubfiles_rec from cachedups inner join entries on entry_id=entries.id where cachedups.size>0 {wbasedir} order by {orderby} desc") #where not parentdir in (select path from cachedups)
+        for type,path,size,hash,ndups,parentdir,nsubfiles_rec in rs:
+            rs2 = cur2.execute("select entry_id from cachedups inner join entries on entry_id=entries.id where parentdir=?", parentdir).fetchall()[0]
+            if len(rs2):
+                continue
 
     def compute_cachedups_d(self,basedir=""): # FIXME: Experimental function supporting getincluded()
         cur = self.conn.cursor()
@@ -469,7 +453,8 @@ class DDB():
 
     def showdups(self,basedir="",mountpoint="",nres=None,orderbysize=True):
         """Main function to display the duplicate entries (file or dirs) sorted by decreasing size"""
-        orderby = "totaldupsize" if orderbysize else "nsubfiles_rec"
+        #orderby = "totaldupsize" if orderbysize else "nsubfiles_rec"
+        orderby = "entries.size" if orderbysize else "nsubfiles_rec"
         #orderby = "cachedups.size" if orderbysize else "nsubfiles_rec"
         cur = self.conn.cursor()
         cur2 = self.conn.cursor()
@@ -564,13 +549,13 @@ class DDB():
                 print(colored(f"0x{xxh+(1<<63):0>16x}, {ndups} * {size>>20} Mo :", 'yellow'))
                 print('\t'+'\n\t'.join(paths))
 
-    def walk(self,init_path=''):
+    def walk(self,init_path=''): # FIXME: self.init_path ?
         """Same function as os.walk() for filesystems"""
         cur = self.conn.cursor()
         cur2 = self.conn.cursor()
-        for res in cur.execute('select path from dirs where path like ? order by path',(init_path+'/%',)):
+        for res in cur.execute("select path from entries where type='D' and path like ? order by path", (init_path+'/%',)):
             dir=res[0]
-            dirs = [k[0] for k in cur2.execute('select name from dirs where parentdir=?',(dir,))]
+            dirs = [k[0] for k in cur2.execute("select name from entries where type='D' and parentdir=?",(dir,))]
             files = [k[0] for k in cur2.execute("select name from entries where parentdir=? and (type='F' or type='S')",(dir,))]
             #files.append([k[0] for k in cur2.execute('select name from symlinks where parentdir=?',(dir,))])
             yield dir,dirs,files
@@ -709,6 +694,47 @@ class DDB():
         cur.execute("update entries set nsubfiles_rec=? where path=?",(nfiles,adir))
         return nfiles
 
+    def schema2(self): # unfinished. Problem: no details of the contents of virtual columns
+        cur = self.conn.cursor()
+        rs = cur.execute("select name from sqlite_master where type='table' order by name").fetchall()
+        tables = [k[0] for k in rs if k[0] is not None]
+        for table in tables:
+            rs = cur.execute(f"select * from pragma_table_xinfo('{table}') order by name").fetchall()
+
+    def schema(self, dosort=True):
+        def schemasort(a): # make the schema sorted and determinist for future comparisons
+            if not dosort:
+                return a
+            a = re.sub("--.*", "", a) # FIXME: it was nice to have a -- version: XXX in SQL comments. This line discards it
+            a = re.sub("\n *", "", a)
+            table = re.sub("(CREATE TABLE [^ \\(]*).*", "\\1",a)
+            a = re.sub("CREATE TABLE [^\\(]*\\(", "", a)[:-1]
+            a = a.replace(', ',',')
+            c = 0 ; out = ""
+            for k in a: # we need to distinguish ',' separating fields and ',' as part of functions...
+                if k=='(': c+=1
+                elif k==')': c-=1
+                elif k==',' and c>0: k=';'
+                out += k
+            alist = [k.replace(';', ',') for k in out.split(',')]
+            a = ",\n\t".join(sorted(alist))
+            return table + '(\n\t' + a + '\n)'
+        cur = self.conn.cursor()
+        rs = cur.execute("select sql from sqlite_master where type='table' order by name").fetchall()
+        schema_text = ";\n".join([schemasort(k[0]) for k in rs if k[0] is not None])
+        schema_hash = xxhash.xxh64(schema_text).hexdigest()
+        return schema_text, schema_hash
+
+    def migrate2(self):
+        print("Migrating DB")  # FIXME: nsbubfiles_rec is not processed yet
+        self.cur.executescript('''
+                drop index entries_name_idx;
+                alter table entries drop column name;
+                update entries set parentdir_len=1 where parentdir_len=0 and path!='/';
+                alter table entries add column name text GENERATED ALWAYS AS (substr(path,parentdir_len+iif(parentdir_len<2,1,2))) VIRTUAL;
+                create index entries_name_idx on entries(name);
+            ''')
+
     def migrate(self):
         """Migrate from old to new DB schema (table 'entries' instead of tables 'files', 'dirs' and 'symlinks')"""
         tables = [k[0] for k in self.cur.execute("select name from sqlite_master where type='table'").fetchall()]
@@ -723,7 +749,7 @@ class DDB():
                     path text UNIQUE NOT NULL,
                     parentdir_len integer,
                     parentdir text GENERATED ALWAYS AS (substr(path,1,parentdir_len)) VIRTUAL,
-                    name text GENERATED ALWAYS AS (substr(path,parentdir_len+2)) VIRTUAL,
+                    name text GENERATED ALWAYS AS (substr(path,parentdir_len+iif(parentdir_len<2,1,2))) VIRTUAL,
                     size integer,
                     hash integer,
                     magictype integer,
@@ -785,6 +811,7 @@ if __name__ == "__main__":
     parser_scan = subparsers.add_parser('scan', help="Scan directory")
     parser_scan.add_argument("path", help="path to scan")
     parser_scan.add_argument("--resetdb", "-R", help="Reset DB", action='store_true', default=False)
+    parser_scan.add_argument("--previousdb", "-p", help="Previous DB (speed up scan)", default=None)
     parser_scan.add_argument("--chunksize", "-C", help="file chunk size in bytes for xxhash (default is 1 MB)", default=FILE_HASH_CHUNKSIZE>>10)
     # FIXME: add option to use a previous db, and skip dirs (+ copy the previous db contents for those subdirs) when mtime has not changed
 
@@ -817,6 +844,10 @@ if __name__ == "__main__":
 
     subparsers.add_parser('computehash', help="Compute hash")
     subparsers.add_parser('check_zerofile', help="Check whether file is made only of zeros (e.g. corrupted)")
+
+    parser_schema = subparsers.add_parser('schema', help="Print DB schema")
+    parser_schema.add_argument("--sql", "-s", help="Display SQL schema", action='store_true', default=False)
+    parser_schema.add_argument("--hash", "-n", help="Display schema hash", action='store_false', default=True)
 
     subparsers.add_parser('compute_cachedups', help="Compute cachedups")
     parser_showdups = subparsers.add_parser('showdups', help="show duplicates")
@@ -856,7 +887,7 @@ if __name__ == "__main__":
             #ddb.conn.commit()
         ddb=DDB(args.dbfile, rw=True, chunksize=int(args.chunksize)<<10)
         try:
-            ddb.dirscan(args.path)
+            ddb.dirscan(args.path, prevdb = args.previousdb)
             ddb.sync_db()
             ddb.compute_cachedups()
             ddb.conn.close()
@@ -906,6 +937,11 @@ if __name__ == "__main__":
         print(f"0x{fxxh+(1<<63):0>16x}, {fxxh+(1<<63)} {fxxh}, {entrysize>>20} Mo : {args.dbfile}")
     elif args.subcommand=='check_zerofile':
         print(check_zerofile(args.dbfile))
+    elif args.subcommand=='schema':
+        ddb=DDB(args.dbfile)
+        schema,shash = ddb.schema()
+        if args.sql: print(schema)
+        if args.hash: print(f"Schema hash: {shash}")
     elif args.subcommand=='compute_cachedups':
         ddb=DDB(args.dbfile)
         ddb.compute_cachedups()

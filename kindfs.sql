@@ -1,13 +1,14 @@
-PRAGMA user_version = 2;
-
+PRAGMA user_version = 3;
 drop table if exists entries;
 create table entries(
     id integer primary key autoincrement,
-    type CHAR(1) NOT NULL,
+    type text NOT NULL,
     path text UNIQUE NOT NULL,
     parentdir_len integer,
     parentdir text GENERATED ALWAYS AS (substr(path,1,parentdir_len)) VIRTUAL,
     name text GENERATED ALWAYS AS (substr(path,parentdir_len+iif(parentdir_len<2,1,2))) VIRTUAL,
+    ext_len integer,
+    extension text GENERATED ALWAYS AS (substr(path,ext_len+iif(parentdir_len<2,1,2))) VIRTUAL,
     depht integer GENERATED ALWAYS AS (length(path)-length(replace(path,'/',''))-1) VIRTUAL,
     size integer,
     hash integer,
@@ -18,10 +19,11 @@ create table entries(
     symtarget text,
     st_mtime integer, st_mode integer, st_uid integer, st_gid integer, st_ino integer, st_nlink integer, st_dev integer,
     dbsession integer not null
-);
+) strict;
 create index entries_parentdir_idx on entries(parentdir);
 create index entries_path_idx on entries(path);
 create index entries_name_idx on entries(name);
+create index entries_ext_idx on entries(extension);
 create index entries_size_idx on entries(size);
 create index entries_hash_idx on entries(hash);
 create index entries_depht_idx on entries(depht);
@@ -59,7 +61,13 @@ create table postops (
 create index postops_parentdir_idx on postops(parentdir);
 create index postops_path_idx on postops(path);
 
-PRAGMA main.page_size=4096;
-PRAGMA main.cache_size=10000;
-PRAGMA main.locking_mode=EXCLUSIVE;
-PRAGMA main.synchronous=NORMAL;
+--PRAGMA main.journal_mode=WAL;
+--PRAGMA mmap_size = 268435456;
+--PRAGMA main.page_size=4096;
+PRAGMA cache_size = -50000;
+PRAGMA locking_mode = EXCLUSIVE;
+PRAGMA synchronous = NORMAL;
+PRAGMA temp_store = MEMORY;
+PRAGMA journal_mode = MEMORY;
+PRAGMA foreign_keys = OFF;
+PRAGMA auto_vacuum = NONE;
