@@ -1,7 +1,7 @@
 PRAGMA user_version = 3;
 drop table if exists entries;
 create table entries(
-    id integer primary key autoincrement,
+    id integer primary key,
     type text NOT NULL,
     path text UNIQUE NOT NULL,
     parentdir_len integer,
@@ -28,12 +28,12 @@ create index entries_size_idx on entries(size);
 create index entries_hash_idx on entries(hash);
 create index entries_depht_idx on entries(depht);
 
-drop view if exists files;
-create view files as select id,parentdir,name,path,size,hash as xxh64be,st_mtime, st_mode, st_uid, st_gid, st_ino, st_nlink, st_dev,dbsession,magictype from entries where type='F';
-drop view if exists dirs;
-create view dirs as select id,parentdir,name,path,size,nsubfiles,nsubdirs,hash as xxh64be,st_mtime, st_mode, st_uid, st_gid, st_nlink, st_dev,dbsession,magictype from entries where type='D';
-drop view if exists symlinks;
-create view symlinks as select id,parentdir,name,path,symtarget as target,NULL as type,hash as xxh64be,dbsession,magictype from entries where type='S';
+--drop view if exists files;
+--create view files as select id,parentdir,name,path,size,hash as xxh64be,st_mtime, st_mode, st_uid, st_gid, st_ino, st_nlink, st_dev,dbsession,magictype from entries where type='F';
+--drop view if exists dirs;
+--create view dirs as select id,parentdir,name,path,size,nsubfiles,nsubdirs,hash as xxh64be,st_mtime, st_mode, st_uid, st_gid, st_nlink, st_dev,dbsession,magictype from entries where type='D';
+--drop view if exists symlinks;
+--create view symlinks as select id,parentdir,name,path,symtarget as target,NULL as type,hash as xxh64be,dbsession,magictype from entries where type='S';
 
 drop table if exists dbsessions;
 create table dbsessions(
