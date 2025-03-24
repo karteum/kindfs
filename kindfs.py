@@ -118,35 +118,42 @@ def globmulti(globfile,var='path'):
 # DB class
 
 class DDB():
-    def __init__(self, dbname, domagic=False, rw=False, regignore=None, globignore=None,chunksize=FILE_HASH_CHUNKSIZE):
+    def __init__(self, dbname, domagic=False, resume=False, regignore=None, globignore=None,chunksize=FILE_HASH_CHUNKSIZE, prevdb=None):
         self.dbname=dbname
+        self.update = os.path.exists(dbname)
         self.conn = sqlite3.connect(dbname)
         self.conn.create_function("get_parentdir_len", 1, lambda x: 0 if os.path.dirname(x)=='/' else len(os.path.dirname(x)))
+        #self.conn.execute("PRAGMA temp_store = MEMORY") # "pragma query_only = ON" does not enable temp views...
         self.cur = self.conn.cursor()
         self.processedfiles = 0
         self.processedsize = 0
-        if rw==True:
-            print('Looking for resume') # FIXME: make it also work to load the previous version of a db and only scan dirs with updated mtime
+        self.reused = 0
+        self.resume = resume
+        self.curprev = None
+        print((dbname,prevdb))
+        if prevdb is not None and prevdb!=dbname:
+            if self.update: sys.exit('Need a blank newdb when using prevdb !')
+            self.prevdb = prevdb
+            self.connprev = sqlite3.connect(prevdb)
+            self.curprev = self.connprev.cursor()
+        if self.update:
             tables = [k[0] for k in self.cur.execute("select name from sqlite_master where type='table'").fetchall()]
-            if 'entries' in tables:
-                mydirs = self.cur.execute("select path,size,hash,nsubfiles from entries where type='D'").fetchall()
-                if len(mydirs)>0:
-                    print("Resuming from previous scan")
-                    self.dbcache_dirs = {k[0]:[k[1],k[2],k[3]] for k in mydirs}
-                    self.cur.execute("delete from entries where type in ('F', 'S') and not parentdir in (select path from entries where type='D')")
+            if not 'entries' in tables:
+                print('No table entries')
+                sys.exit('Old DB schema. Migrate first !')
+            self.curprev = self.conn.cursor()
+            self.cur.execute("create temp table reviewed_entries (id integer unique)")
+            #if resume==True:
+            #    print('Looking for resume') # FIXME: make it also work to load the previous version of a db and only scan dirs with updated mtime
+            #    mydirs = self.cur.execute("select path,size,hash,nsubfiles from entries where type='D'").fetchall()
+            #    if len(mydirs)>0:
+            #        print("Resuming from previous scan")
+            #        self.dbcache_dirs = {k[0]:[k[1],k[2],k[3]] for k in mydirs}
+                    #self.cur.execute("delete from entries where type in ('F', 'S') and not parentdir in (select path from entries where type='D')")
                     #emptyf = self.cur.execute("select count(*),sum(size) from files").fetchall()
                     #self.processedfiles=emptyf[0][0]
                     #self.processedsize=emptyf[0][1]
-                else:
-                    print('No existing entries')
-            elif 'dirs' in tables or 'files' in tables:
-                sys.exit('Old DB schema. Migrate first !')
-            else:
-                print('No existing tables')
-                self.createdb()
-        else:
-            pass
-            #self.conn.execute("PRAGMA temp_store = MEMORY") # "pragma query_only = ON" does not enable temp views...
+        else: self.createdb()
         #self.init_path=init_path.rstrip('/')
         self.magictypes = {}
         self.domagic=domagic
@@ -167,9 +174,19 @@ class DDB():
 
     def createdb(self):
         print("Creating / resetting DB")
-        cur = self.conn.cursor()
         with open("kindfs.sql", encoding='utf-8') as schema:
-            cur.executescript(schema.read())
+            self.cur.executescript(schema.read())
+
+    def createindexes(self):
+        print("\nCreating indexes")
+        self.cur.executescript("""
+            create index entries_parentdir_idx on entries(parentdir);
+            create index entries_path_idx on entries(path);
+            create index entries_name_idx on entries(name);
+            create index entries_ext_idx on entries(extension);
+            create index entries_size_idx on entries(size);
+            create index entries_hash_idx on entries(hash);
+            create index entries_depht_idx on entries(depht);""")
 
     def magicid(self, path, dofull=True, domime=True):
         """Compute 'magic' filetype from libmagic, insert it in DB (if not already there) and return the ID of that entry"""
@@ -196,17 +213,17 @@ class DDB():
         """Insert line in DB with some caching in order to perform the real insert/commit in batch (for performance) rather than one-by-one"""
         if len(vec)==0:
             return
+        if sync:   # For debug purposes, yet slower than the batch insert (even with pragmas and caching)
+            self.cur.execute(f'insert or replace into entries values ({",".join("?" for k in vec)})', vec)
+            return
         self.dbcache_insert.append(vec)
         mytime2=time.time()
-        if sync or mytime2-self.timer_insert>DB_COMMIT_PERIODICITY:
+        if mytime2-self.timer_insert>DB_COMMIT_PERIODICITY:
             self.sync_db()
             self.timer_insert=time.time() # Not 'mytime2' since sync_db() itself might take a few seconds, maybe more than DB_COMMIT_PERIODICITY
             #self.cur.execute(f'insert or replace into {table} values ({",".join("?" for k in vec)})', vec) #q = '(' + '?,' * (len(vec)-1) + '?)'
 
-    def insert_db1(self,vec):  # For debug purposes, yet slower than the batch insert (even with pragmas and caching)
-        self.cur.execute(f'insert or replace into entries values ({",".join("?" for k in vec)})', vec)
-
-    def dirscan(self, bdir, init_path=None, parentdir=None, dirstat=None, dirlevel=0, prevdb=None):
+    def dirscan(self, bdir, init_path=None, parentdir=None, dirstat=None, dirlevel=0):
         """Recursively scan a dir/ (taking care of encoding issues), compute checksums and store metadata in the DB"""
         if isinstance(bdir,str):
             bdir=bytes(bdir, encoding='utf-8') # This avoids issues when walking through a filesystem with various encodings...
@@ -217,10 +234,9 @@ class DDB():
             mytime2=time.time()
             if mytime2-self.timer_print>DISPLAY_PERIODICITY:
                 k=dbpath(dir_printable)
-                ld=len(k) - (os.get_terminal_size()[0]-40)
-                if ld>0:
-                    k=colored("...",'red')+k[ld:]
-                sys.stderr.write(f"\033[2K\rScanning: [{self.processedsize>>20} MB, {self.processedfiles} files] {k}")
+                strprefix = f"Scanning: [{self.processedsize>>20} MB, {self.processedfiles} files, {self.processedfiles - self.reused} new] "
+                ld=len(k) - (os.get_terminal_size()[0]-len(strprefix)-5) # -40 ?
+                sys.stderr.write(f"\033[2K\r{strprefix}{colored('...','red')+k[ld:] if ld>0 else k}")
                 sys.stderr.flush()
                 self.timer_print=mytime2
 
@@ -234,7 +250,7 @@ class DDB():
         parentdir_len = len(dbpath(parentdir)) if parentdir!=None else 0
         curdir_len = len(dbpath(dir))
 
-        if hasattr(self,'dbcache_dirs'): # Resume / speedup scan
+        if hasattr(self,'dbcache_dirs'): # Resume / speedup scan. FIXME: obsolete ?
             mypath=dbpath(dir_printable)
             if mypath in self.dbcache_dirs:
                 mysize,myxxh,mysubfiles = self.dbcache_dirs[mypath]
@@ -243,10 +259,10 @@ class DDB():
                 return mysize,myxxh
             #else: # FIXME: seems counter productive (sqlite bottleneck ?)
             #    refdb_alreadythere={k[0]:k[1] for k in self.cur_ref.execute("select path,size from files where parentdir=?", (dbpath(dir_printable),)).fetchall() }
-
-        if prevdb is not None:
-            connprev = sqlite3.connect(prevdb)
-            curprev = connprev.cursor()
+        if self.resume:  # Must only be done if the underlying filesystem has not changed since previous aborted scan (if unsure, don't do a resume since it will skip all subdirectories that are assumed to be already scanned !)
+            rs = self.cur.execute("select size,hash,nsubfiles_rec from entries where type='D' and path=? st_mtime=?", (dbpath(dir), int(dirstat.st_mtime))).fetchall()
+            if len(rs)>0:
+                return entrysize,dxxh,nsr
 
         dirsize=0 # size of current dir including subdirs
         dircontents = array('q') # Array of hashes for the contents of current dir. array('q') is more space-efficient than linked list, and better than numpy in this phase as it can easily grow without destroying/recreating the array
@@ -260,14 +276,15 @@ class DDB():
             if not os.path.exists(path) or not os.access(path, os.R_OK):
                 continue
             if entry.is_dir(follow_symlinks=False):
-                try:
-                    entrysize,dxxh,nsr = self.dirscan(entry.path,init_path=init_path,parentdir=dir_printable,dirstat=entry.stat(follow_symlinks=False),dirlevel=dirlevel+1)
-                    # Insertion in DB is below at dir toplevel (and this is a recursive call)
-                    dircontents.append(dxxh)
-                    dir_numdirs+=1
-                    dir_nsubfiles_rec += nsr
-                except:
-                    sys.stderr.write(f"\n=> Error in {path_printable}\n")
+                #try:
+                dirstat = entry.stat(follow_symlinks=False)
+                entrysize,dxxh,nsr = self.dirscan(entry.path,init_path=init_path,parentdir=dir_printable,dirstat=dirstat,dirlevel=dirlevel+1)
+                # Insertion in DB is below at dir toplevel (and this is a recursive call)
+                dircontents.append(dxxh)
+                dir_numdirs+=1
+                dir_nsubfiles_rec += nsr
+                #except:
+                #    sys.stderr.write(f"\n=> Error in {path_printable}\n") # FIXME: log errors somewhere in DB
             elif entry.is_symlink():
                 ltarget = os.readlink(path)
                 lxxh = xxhash.xxh64(name + ' -> ' + ltarget).intdigest() - (1<<63)
@@ -293,10 +310,13 @@ class DDB():
                 filestat = entry.stat(follow_symlinks=False)
                 entrysize = int(filestat.st_size)
                 fxxh = None
-                if prevdb is not None:
-                    fxxh = curprev.execute("select size,st_mtime,hash where type='F' and path=? and size=? and st_mtime=?", path_in_db, entrysize, int(filestat.st_mtime)).fetchall[0][0]
-                if fxxh is None: # fxxh may still be None after the previous query
+                if self.curprev is not None:  # true both in case a prevdb is used, and in case of resume
+                    rs = self.curprev.execute("select hash from entries where type='F' and path=? and size=? and st_mtime=?", (path_in_db, entrysize, int(filestat.st_mtime))).fetchall()
+                    if len(rs)>0: fxxh = rs[0][0]
+                if fxxh is None:
                     fxxh = xxhash_file(path, entrysize, chunksize=self.chunksize)
+                else:
+                    self.reused += 1
                 ext_len = path_in_db.rindex('.') if "." in path_in_db[curdir_len:] else None
                 mymagicid = self.magicid(path)
                 self.insert_db((
@@ -329,6 +349,10 @@ class DDB():
         if dirstat==None:
             dirstat = os.lstat(dir)
         path_in_db = dbpath(dir_printable)
+        #if self.curprev is not None:
+        #    rs = self.curprev.execute("select size,hash,nsubfiles_rec from entries where type='D' and path=? and size=? and st_mtime=?", (path_in_db, dirsize, int(filestat.st_mtime))).fetchall()
+        #    if len(rs)>0: entrysize,dxxh,nsr = rs[0]
+
         self.insert_db((
             None,                             # id integer primary key autoincrement
             'D',                              # type: dir
@@ -816,9 +840,10 @@ if __name__ == "__main__":
             os.remove(args.dbfile)
             #ddb.createdb()
             #ddb.conn.commit()
-        ddb=DDB(args.dbfile, rw=True, chunksize=int(args.chunksize)<<10)
+        ddb=DDB(args.dbfile, resume=False, chunksize=int(args.chunksize)<<10, prevdb = args.previousdb)
         try:
-            ddb.dirscan(args.path, prevdb = args.previousdb)
+            ddb.dirscan(args.path)
+            ddb.createindexes()
             ddb.sync_db()
             ddb.compute_cachedups()
             ddb.conn.close()
@@ -839,7 +864,7 @@ if __name__ == "__main__":
         ddb.isincluded(args.dirA, args.dirB,
                        otherddbfs=args.otherdb, basedir=args.mountpoint,
                        display_included=args.display_included,
-                       display_notincluded=args.display_notincluded)
+                       display_notincluded=args.display_notincluded, raw=False)
     elif args.subcommand=='diff':
         ddb=DDB(args.dbfile)
         ddb.diff(args.dirA, args.dirB)

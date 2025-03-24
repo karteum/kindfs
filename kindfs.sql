@@ -20,13 +20,13 @@ create table entries(
     st_mtime integer, st_mode integer, st_uid integer, st_gid integer, st_ino integer, st_nlink integer, st_dev integer,
     dbsession integer not null
 ) strict;
-create index entries_parentdir_idx on entries(parentdir);
-create index entries_path_idx on entries(path);
-create index entries_name_idx on entries(name);
-create index entries_ext_idx on entries(extension);
-create index entries_size_idx on entries(size);
-create index entries_hash_idx on entries(hash);
-create index entries_depht_idx on entries(depht);
+--create index entries_parentdir_idx on entries(parentdir);
+--create index entries_path_idx on entries(path);
+--create index entries_name_idx on entries(name);
+--create index entries_ext_idx on entries(extension);
+--create index entries_size_idx on entries(size);
+--create index entries_hash_idx on entries(hash);
+--create index entries_depht_idx on entries(depht);
 
 --drop view if exists files;
 --create view files as select id,parentdir,name,path,size,hash as xxh64be,st_mtime, st_mode, st_uid, st_gid, st_ino, st_nlink, st_dev,dbsession,magictype from entries where type='F';
@@ -61,7 +61,7 @@ create table postops (
 create index postops_parentdir_idx on postops(parentdir);
 create index postops_path_idx on postops(path);
 
---PRAGMA main.journal_mode=WAL;
+PRAGMA main.journal_mode=WAL;
 --PRAGMA mmap_size = 268435456;
 --PRAGMA main.page_size=4096;
 PRAGMA cache_size = -50000;
