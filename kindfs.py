@@ -619,12 +619,12 @@ class DDB():
         cur = self.conn.cursor()
         return cur.execute("select sum(size) from files").fetchall()[0][0]
 
-    def isincluded(self, path_test, path_ref, otherddbfs=None, docount=True,display_included=False,display_notincluded=True,basedir="", checkfs=True, raw=False, do_fullcheck=True):
+    def isincluded(self, path_test, path_ref, otherddbfs=None, docount=True,display_included=False,display_notincluded=True,basedir="", checkfs=True, raw=False):
         """Checks whether every file under path_test/ (and subdirs) has a copy somewhere in path_ref (regardless of the directory structure in path_ref/ )"""
         def fullcheck(path0, pathlist):
             for p in pathlist:
                 #print(f"\nchecking {path0} | {p}")
-                if filecmp.cmp(path0, p, shallow=False):
+                if os.path.exists(path0) and filecmp.cmp(path0, p, shallow=False):
                     return True
             return False
         cur = self.conn.cursor()
@@ -676,7 +676,7 @@ class DDB():
                             sys.stderr.write(f"\033[2K\r")
                             print(colored(f"No equivalent anymore for ({size>>20} Mo) : {path}",'red'))
                 elif display_included:  # in that case we only display results for dirA that _are_ in dirB
-                    if do_fullcheck and fullcheck(basedir+path, [basedir+z[0] for z in rs2])==False:
+                    if checkfs and fullcheck(basedir+path, [basedir+z[0] for z in rs2])==False:
                         continue
                     if(raw): print(path)
                     else:
