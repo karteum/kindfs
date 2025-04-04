@@ -47,11 +47,9 @@ static const struct fuse_opt option_spec[] = {
 static void *kindfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
     (void) conn; // avoid warning: unused parameter ‘conn’ [-Wunused-parameter]
     char dbpath_full[4096];
-    char tmp[4096];
-    cfg->kernel_cache = 1;
-    //cfg->auto_cache = 1;
-    conn->want = FUSE_CAP_ASYNC_READ;
-    //conn->want &= ~FUSE_CAP_ASYNC_READ;
+    //char tmp[4096];
+    cfg->kernel_cache = 1; //cfg->auto_cache = 1;
+    conn->want = FUSE_CAP_ASYNC_READ; //conn->want &= ~FUSE_CAP_ASYNC_READ;
     struct kindfs_data *data = (struct kindfs_data *)fuse_get_context()->private_data;
     printf("Init: cwd %s\n", data->cwd);
     strcpy(dbpath_full, data->cwd);
@@ -63,9 +61,8 @@ static void *kindfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
     if(sqlite3_open(dbpath_full, &db)) {
         fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
         exit(1);
-    } else {
-        fprintf(stderr, "Opened database successfully\n");
-    }
+    } else fprintf(stderr, "Opened database successfully\n");
+
     return NULL;
 }
 
@@ -84,49 +81,43 @@ static int kindfs_getattr(const char *path, struct stat *stbuf, struct fuse_file
 {
     (void) fi;
     int k = 0;
-    static sqlite3_stmt *stmt;
+    static sqlite3_stmt *stmt = NULL;
     char buf[256];
     SQL_COMPILE(db, stmt, "select size st_size, st_mtime, st_mode, st_uid, st_gid, st_dev, hash st_ino, st_nlink, type from entries where path=?");
     sqlite3_bind_text(stmt, 1, path, strlen(path), SQLITE_STATIC);
     memset(stbuf, 0, sizeof(struct stat));
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        stbuf->st_size = sqlite3_column_int64(stmt, 0);
-        stbuf->st_mtime = sqlite3_column_int64(stmt, 1);
-        stbuf->st_mode = sqlite3_column_int(stmt, 2);
-        stbuf->st_uid = sqlite3_column_int(stmt, 3);
-        stbuf->st_gid = sqlite3_column_int(stmt, 4);
-        stbuf->st_dev = sqlite3_column_int64(stmt, 5); // FIXME: +(1<<63) ?
-        stbuf->st_ino = sqlite3_column_int64(stmt, 6);
-        stbuf->st_nlink = sqlite3_column_int(stmt, 7);
-        const unsigned char *type = sqlite3_column_text(stmt, 8);
-        if (*type=='F') {
-            stbuf->st_blocks = stbuf->st_size >> 9;
-            fakecontents(stbuf->st_ino, stbuf->st_size, buf);
-            stbuf->st_size = strlen(buf);
-        }
-        else if (*type=='D') stbuf->st_size = 0;
-        else if (*type=='S') {
-            stbuf->st_size = stbuf->st_mtime = stbuf->st_dev = 0;
-            stbuf->st_mode = S_IFLNK | 0755;
-            stbuf->st_uid = stbuf->st_gid = 1000;
-            stbuf->st_nlink = 1;
-        }
-        k++;
+    if (sqlite3_step(stmt) != SQLITE_ROW) return -ENOENT;
+    stbuf->st_size = sqlite3_column_int64(stmt, 0);
+    stbuf->st_mtime = sqlite3_column_int64(stmt, 1);
+    stbuf->st_mode = sqlite3_column_int(stmt, 2);
+    stbuf->st_uid = sqlite3_column_int(stmt, 3);
+    stbuf->st_gid = sqlite3_column_int(stmt, 4);
+    stbuf->st_dev = sqlite3_column_int64(stmt, 5); // FIXME: +(1<<63) ?
+    stbuf->st_ino = sqlite3_column_int64(stmt, 6);
+    stbuf->st_nlink = sqlite3_column_int(stmt, 7);
+    const unsigned char *type = sqlite3_column_text(stmt, 8);
+    if (*type=='F') {
+        stbuf->st_blocks = stbuf->st_size >> 9;
+        fakecontents(stbuf->st_ino, stbuf->st_size, buf);
+        stbuf->st_size = strlen(buf);
     }
-    if (k)
-        return 0;
-    return -ENOENT;
+    else if (*type=='D') stbuf->st_size = 0;
+    else if (*type=='S') {
+        stbuf->st_size = stbuf->st_mtime = stbuf->st_dev = 0;
+        stbuf->st_mode = S_IFLNK | 0755;
+        stbuf->st_uid = stbuf->st_gid = 1000;
+        stbuf->st_nlink = 1;
+    }
+    return 0;
     //sqlite3_finalize(stmt);
 }
 
 static int kindfs_opendir(const char *path, struct fuse_file_info *fi) {
     (void) fi;
-    static sqlite3_stmt *stmt;
+    static sqlite3_stmt *stmt = NULL;
     SQL_COMPILE(db, stmt, "select hash from entries where path=? and type='D'");
     sqlite3_bind_text(stmt, 1, path, strlen(path), SQLITE_STATIC);
-    int k=0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) k++;
-    return k ? 0 : -ENOENT;
+    return (sqlite3_step(stmt) == SQLITE_ROW) ? 0 : -ENOENT;
 }
 
 #define FUSE_FILL_DIR_DEFAULTS 0
@@ -136,7 +127,7 @@ static int kindfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, o
     (void) flags;
 
     int res = 0;
-    static sqlite3_stmt *stmt;
+    static sqlite3_stmt *stmt = NULL;
     SQL_COMPILE(db, stmt, "select name from entries where parentdir=? and name!=''");
 
     filler(buf, ".", NULL, 0, FUSE_FILL_DIR_DEFAULTS);
@@ -152,32 +143,25 @@ static int kindfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, o
 
 static int kindfs_open(const char *path, struct fuse_file_info *fi) {
     (void) fi;
-    static sqlite3_stmt *stmt;
+    static sqlite3_stmt *stmt = NULL;
     SQL_COMPILE(db, stmt, "select hash from entries where path=? and type='F'");
-
     sqlite3_bind_text(stmt, 1, path, strlen(path), SQLITE_STATIC);
-    int k=0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) k++;
-    return k ? 0 : -ENOENT;
+    return (sqlite3_step(stmt) == SQLITE_ROW) ? 0 : -ENOENT;
 }
 
 static int kindfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
     (void) fi;
     char contents[256] = {0};
     size_t len;
-    static sqlite3_stmt *stmt;
+    static sqlite3_stmt *stmt = NULL;
     SQL_COMPILE(db, stmt, "select hash,size from entries where path=? and type='F'");
 
     sqlite3_bind_text(stmt, 1, path, strlen(path), SQLITE_STATIC);
-    int k=0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        int hash = sqlite3_column_int64(stmt, 0);
-        int size = sqlite3_column_int64(stmt, 1);
-        fakecontents(hash, size, contents);
-        len = strlen(contents);
-        k++;
-    }
-    if (!k) return -ENOENT;
+    if (sqlite3_step(stmt) != SQLITE_ROW) return -ENOENT;
+    int hash = sqlite3_column_int64(stmt, 0);
+    int sizetot = sqlite3_column_int64(stmt, 1);
+    fakecontents(hash, sizetot, contents);
+    len = strlen(contents);
 
     if (offset < len) {
         if (offset + size > len) size = len - offset;
@@ -188,16 +172,13 @@ static int kindfs_read(const char *path, char *buf, size_t size, off_t offset, s
 }
 
 static int kindfs_readlink(const char *path, char *link, size_t size) {
-    static sqlite3_stmt *stmt;
+    static sqlite3_stmt *stmt = NULL;
     SQL_COMPILE(db, stmt, "select symtarget from entries where path=? and type='S'");
     sqlite3_bind_text(stmt, 1, path, strlen(path), SQLITE_STATIC);
-    int k=0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        const unsigned char *symtarget = sqlite3_column_text(stmt, 0);
-        strncpy(link, symtarget, size);
-        k++;
-    }
-    return k ? 0 : -ENOENT;
+    if (sqlite3_step(stmt) != SQLITE_ROW) return -ENOENT;
+    const unsigned char *symtarget = sqlite3_column_text(stmt, 0);
+    strncpy(link, symtarget, size);
+    return 0;
 }
 
 static const struct fuse_operations kindfs_oper = {
@@ -220,7 +201,7 @@ static void show_help(const char *progname) {
 int main(int argc, char *argv[]) {
     int ret;
     struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
-    options.dbfile = strdup("foo.db");
+    options.dbfile = strdup("foo.db"); // FIXME: make it mandatory to specify dbfile on the CLI
     options.cwd = getcwd(NULL, 0);
     if (fuse_opt_parse(&args, &options, option_spec, NULL) == -1)
         return 1;
