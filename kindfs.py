@@ -501,6 +501,59 @@ class DDB():
             print(colored(f"{ftype} 0x{hash+(1<<63):0>16x}, {ndups} * {size>>20} Mo | {nsubfiles_rec} files : ", 'yellow') + path_real)
             #print(colored(f"{ftype} {hash+(1<<63)}, {ndups} * {size} | {nsubfiles_rec} files : ", 'yellow') + path_real)
 
+    def compute_partial_dup_dirs(self, dir, depth=0, direntry_id=None):
+        """Recursive call to compute table dir_containing_dups which further enables to show the % of duplicates within each dir"""
+        cur = self.conn.cursor()
+        cur2 = self.conn.cursor()
+        if depth==0:
+            print('__reset')
+            #tables = [k[0] for k in self.cur.execute("select name from sqlite_master where type='table'").fetchall()]
+            #if not 'cachedups_d' in tables:
+            cur.execute("drop table if exists dir_containing_dups")
+            cur.execute("create table dir_containing_dups (entry_id integer not null, szdup integer, ndupsubs integer)")
+            direntry_id,totsize = cur.execute("select id,size from entries where path=?", (dir,)).fetchall()[0]
+            self.totsize = totsize
+            self.totseen = 0
+            #cur.execute("insert into dir_containing_dups (entry_id, szdup, ndupsubs) values (1, 2, 3)")
+        rs = cur.execute("select id,path,size,type,nsubfiles_rec from entries where parentdir=? and type!='S'", (dir,))
+        dupsize=0
+        ndups=0
+        for entry_id, path, size, entrytype, nsubfiles_rec in rs:
+            #print((entry_id, path, size, entrytype))
+            isdup = cur2.execute("select entry_id from cachedups where entry_id=?", (entry_id,)).fetchall()
+            if len(isdup)>0:
+                dupsize += size
+                ndups+=1 if entrytype=='F' else nsubfiles_rec
+                self.totseen += size
+            elif entrytype=='D':
+                tmp0, tmp1= self.compute_partial_dup_dirs(path, depth+1, entry_id)
+                dupsize += tmp0
+                ndups += tmp1
+            else: # 'F'
+                self.totseen += size
+
+            mytime2=time.time()
+            if mytime2-self.timer_print>DISPLAY_PERIODICITY:
+                sys.stderr.write(f"\033[2K\rComputing dir duplicates : {100*self.totseen//self.totsize} %")
+                sys.stderr.flush()
+                self.timer_print=mytime2
+        if dupsize >0:
+            #print((direntry_id, dupsize, ndups))
+            cur.execute("insert into dir_containing_dups (entry_id, szdup, ndupsubs) values (?, ?, ?)", (direntry_id, dupsize, ndups))
+
+        return dupsize, ndups
+
+    def show_partial_dup_dirs(self,basedir="",mountpoint="",nres=None,orderby="szdup desc"): #orderby="pcdup desc,szdup desc"
+        """Main function to display the duplicate entries (file or dirs) sorted by decreasing size"""
+        # orderby = "totaldupsize" | "nsubfiles_rec" | "entries.size" | "cachedups.size"
+        cur = self.conn.cursor()
+        cur2 = self.conn.cursor()
+        wbasedir = f"and path like '{basedir}/%'" if basedir!='' else "" #"where type='D'"
+        limit_nres = f'limit {int(nres)}' if nres else ''
+        rs = cur.execute(f"select path,entries.size, nsubfiles_rec, round(100*szdup/entries.size) pcdup, round(100*ndupsubs/nsubfiles_rec) pcfiles from dir_containing_dups inner join entries on entry_id=entries.id where pcdup > 80 {wbasedir} order by {orderby} {limit_nres}") #where not parentdir in (select path from cachedups)
+        for path, size, nsubfiles_rec, pcdup, pcfiles in rs:
+            print(colored(f"{pcdup} % * {size>>20} Mo | {pcfiles} % * {nsubfiles_rec} files : ", 'yellow') + path)
+
     def show_same_inode(self,basedir="",nres=None):
         """Same as showdups() but only return entries with identical inodes"""
         cur = self.conn.cursor()
@@ -811,6 +864,13 @@ if __name__ == "__main__":
     parser_showdups.add_argument("--limit", "-l", help="Max number of results", default=None)
     parser_showdups.add_argument("--orderby", "-o", help="indiv_size | total_size | num_subfiles", default="total_size")
 
+    subparsers.add_parser('compute_partial_dup_dirs', help="Compute partial dup dirs")
+    parser_showpartialdups = subparsers.add_parser('show_partial_dup_dirs', help="show duplicates")
+    parser_showpartialdups.add_argument("--mountpoint", "-m", help="mountpoint for checking whether files are still present", default='')
+    parser_showpartialdups.add_argument("--basedir", "-b", help="Basedir", default='')
+    parser_showpartialdups.add_argument("--limit", "-l", help="Max number of results", default=None)
+    parser_showpartialdups.add_argument("--orderby", "-o", help="indiv_size | total_size | num_subfiles", default="total_size")
+
     parser_grep = subparsers.add_parser('grep', help="grep text")
     parser_grep.add_argument("--mountpoint", "-m", help="mountpoint", default='')
     parser_grep.add_argument("--wordlist", "-w", help="mountpoint", nargs="+", required=True)
@@ -896,6 +956,14 @@ if __name__ == "__main__":
     elif args.subcommand=='compute_cachedups':
         ddb=DDB(args.dbfile)
         ddb.compute_cachedups()
+    elif args.subcommand=='compute_partial_dup_dirs':
+        ddb=DDB(args.dbfile)
+        ddb.compute_partial_dup_dirs('/')
+        ddb.conn.commit()
+        ddb.conn.close()
+    elif args.subcommand=='show_partial_dup_dirs':
+        ddb=DDB(args.dbfile)
+        ddb.show_partial_dup_dirs(basedir=args.basedir, mountpoint=args.mountpoint, nres=args.limit)
     elif args.subcommand=='showdups':
         ddb=DDB(args.dbfile)
         my_order = {"indiv_size": "entries.size", "total_size": "totaldupsize", "num_subfiles": "nsubfiles_rec"} # "cachedups.size"
